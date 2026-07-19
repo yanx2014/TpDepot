@@ -58,6 +58,18 @@ You must unlock the vault before setting a key. Press **Save & verify** and the 
 1. **ICP scoring** (skill: `icp-scoring`) — captures the Minimal Semantic Payload + company headcount (cached by company name), embeds it, and computes the score **entirely in code** (semantic cosine ×60 + headcount 25 + location/industry 15). No LLM touches the math — this is both the skill rule and the efficient path. Produces the verbatim **LinkedIn Profile ICP Analysis Report**.
 2. **Persona + outreach** (skills: `persona-framework` + `email-outreach`) — only when the score ≥ threshold. A **single Qwen call** builds the full 6-section Persona Card with the 30/40/30 Opportunity Score, then the three French emails (Pattern Interrupt / Value-Add Nudge / Diagnostic Break-up), grounded in the persona card, the offer, and only observed facts. Posts/comments follow the skill's X=5 / 12−X=7 rule.
 
+### What gets captured, and where (per skill)
+
+The Feed uses a **graceful "lite" capture** (`CAPTURE_PROFILE_LITE`): the always-rendered top-card facts are read first, then the Experience section best-effort. A missing Experience section **no longer discards the whole profile** — ICP scoring only needs the top-card facts, so the row still gets a score (persona depth degrades). Only a real authwall / checkpoint (no name) fails a row.
+
+| Skill | Data it needs | Where it comes from |
+|---|---|---|
+| **icp-scoring** | Minimal Semantic Payload (headline, title, company), location; company headcount/industry/HQ | Top card `h1` + `.text-body-medium` (headline) + `.text-body-small` (location); current **title & company fall back to the headline** (`"… at/chez/@ Company"`) when Experience isn't captured; headcount/industry from the company **About** page |
+| **persona-framework** | §1 Professional DNA (roles, tenure, descriptions); §2 posts + comments; §3 company context | Experience card (found by `#experience` anchor → heading text → content fallback; grouped roles inherit the company); `/recent-activity/posts` (5) and `/comments` (7); company **About** page |
+| **email-outreach** | hook / pain / proof variables | Derived from the completed Persona Card + the offer doc |
+
+Experience-section detection is now three-layered (stable anchor id, exact "Expérience/Experience" heading, then a content fallback that finds the card holding the most company-anchor + dated items), and the Feed capture **briefly activates the worker tab on retry** so LinkedIn's lazy-loaded Experience list actually renders (hidden tabs often never populate it) — the fix for the `experience_section_not_found` failures.
+
 The run is durable (survives service-worker restarts via the heartbeat alarm), pauses on LinkedIn checkpoints, and closes its worker tab when finished.
 
 **Output:** `lead-url-lens-feed.csv` — the source URL plus **ICP Score** (the full analysis report), **Persona Card**, **Opportunity Score**, **Outreach 1/2/3** — verbatim skill output per row. **Download CSV** re-exports (including partial results after a pause or cancel).

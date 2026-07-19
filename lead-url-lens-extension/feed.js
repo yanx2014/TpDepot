@@ -52,14 +52,21 @@ export function canonicalProfileUrl(raw) {
 }
 
 /* ------------------------------------------------------- fact preparation */
+// Fallback current title + company parsed from the headline (e.g. "Director at Morgan Stanley | …").
+export function headlineParts(headline) {
+  const first = String(headline || "").split(/[|•·]/)[0].trim();
+  const m = first.match(/^(.*?)\s+(?:at|chez|@|-)\s+(.+)$/i);
+  return m ? { title: m[1].trim(), company: m[2].trim() } : { title: first, company: "" };
+}
 export function factsForProfile(data = {}) {
+  const hp = headlineParts(data.headline);
   return {
     profile_url: data.profile_url || "",
     full_name: data.full_name || "",
     headline: data.headline || "",
     location: data.location || "",
-    current_role: data.role_headline || data.role || "",
-    current_company: data.company || "",
+    current_role: data.role_headline || data.role || hp.title || "",
+    current_company: data.company || hp.company || "",
     role_is_current: Boolean(data.role_is_current),
     role_start_date: data.role_start_date || "",
     role_description: data.role_description || "",
@@ -76,7 +83,7 @@ export function factsForProfile(data = {}) {
       website: data.company_page.website || data.company_website_candidate || "",
       specialties: data.company_page.specialties || "",
       description: (data.company_page.description || "").slice(0, 800),
-    } : { name: data.company || "", size: "", industry: "", headquarters: "" },
+    } : { name: data.company || hp.company || "", size: "", industry: "", headquarters: "" },
     recent_posts: (data.posts || []).map(p => (p.content || "").slice(0, 700)).filter(Boolean).slice(0, 5),
     recent_comments: (data.comments || []).map(c => (c.content || "").slice(0, 500)).filter(Boolean).slice(0, 7),
   };

@@ -285,11 +285,30 @@ async function vaultSessionRaw(){return (await chrome.storage.session.get("feedS
 async function vaultUnlockedKey(){const raw=await vaultSessionRaw();return raw?importKeyRaw(raw):null;}
 async function vaultGet(kind){const key=await vaultUnlockedKey();if(!key)return null;const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};if(!vault[kind])return "";try{return await decryptWithKey(key,vault[kind]);}catch{return "";}}
 function feedString(value){return typeof value==="string"?value:(value==null?"":JSON.stringify(value));}
+// Feed capture: uses the graceful CAPTURE_PROFILE_LITE (top-card facts + best-effort
+// experience, no hard-fail on a missing Experience section). Attempt 1 runs in the
+// background tab; retries briefly activate the tab so LinkedIn's lazy-loaded
+// Experience list renders (hidden tabs often never populate it), then focus is restored.
+async function captureProfileLiteSurface(tabId, profileUrl){
+  let last={blocked:true,error_code:"profile_surface_timeout",error_message:"Profile did not render."};
+  const [prev]=await chrome.tabs.query({active:true,currentWindow:true});
+  for(let attempt=0;attempt<3;attempt++){
+    await chrome.tabs.update(tabId,{url:profileUrl,active:attempt>=1,autoDiscardable:false});
+    await waitLoaded(tabId);
+    if(!await ensureProfileReceiver(tabId)){last={blocked:true,error_code:"profile_receiver_unavailable"};continue;}
+    try{last=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_PROFILE_LITE"});}catch(error){last={blocked:true,error_code:"profile_capture_failed",error_message:error.message};}
+    if(last&&!last.blocked)break;
+    if(["linkedin_checkpoint","authentication_required","unsupported_page","profile_name_missing"].includes(last?.error_code))break;
+    try{await chrome.tabs.reload(tabId);await waitLoaded(tabId);}catch{}
+  }
+  if(prev?.id&&prev.id!==tabId)try{await chrome.tabs.update(prev.id,{active:true});}catch{}
+  return last;
+}
 async function captureProfileForFeed(tabId, profileUrl){
-  const data = await captureProfileSurface(tabId, profileUrl);
+  const data = await captureProfileLiteSurface(tabId, profileUrl);
   if(data?.blocked && data.error_code==="linkedin_checkpoint") return {checkpoint:true};
-  if(data?.blocked || !data?.validation?.completed){
-    return {ok:false, error_code:data?.error_code||"profile_validation_failed", error_message:data?.error_message||(data?.validation?.errors||[]).join(", ")};
+  if(data?.blocked){
+    return {ok:false, error_code:data?.error_code||"profile_capture_failed", error_message:data?.error_message||""};
   }
   // Best-effort recent activity + company facts — strengthens outreach, never blocks the row.
   try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/posts/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const posts=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"post",limit:5}).catch(()=>[]);data.posts=Array.isArray(posts)?posts.slice(0,5):[];}catch{data.posts=[];}
