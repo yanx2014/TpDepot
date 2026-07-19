@@ -25,23 +25,31 @@ The token is verified before use and is hidden after connection. Collection uses
 
 ## Feed workflow
 
-The **Feed** tab runs an end-to-end analysis of a list of LinkedIn profiles and exports a CSV. It runs entirely in your browser and calls an LLM API directly with a key you provide.
+The **Feed** tab runs an end-to-end analysis of a list of LinkedIn profiles and exports a CSV. It runs entirely in your browser and implements the three recruitment-niche skills (`.claude/skills/icp-scoring`, `persona-framework`, `email-outreach`).
 
-Inputs:
+### Keys (encrypted, write-only)
 
-- **LLM provider + API key** — Anthropic (default, model `claude-opus-4-8`) or OpenAI. The key is stored locally in the extension and used only for the analysis calls. An optional model field overrides the default.
-- **Profiles file** — `LINKS_TO_ANALYZE.md`: choose a local file or paste a raw URL (e.g. a GitHub raw link). Every `linkedin.com/in/…` or `/sales/lead/…` URL in the file is analyzed, in order, de-duplicated (up to 1000).
-- **ICP definition** — `icps.md`: a local file or raw URL describing the Ideal Customer Profile.
-- **Threshold** — the ICP score (0–100) at or above which persona and outreach are generated. Default 60.
+- **Qwen API key** — reasoning (persona + outreach). Provider defaults to Qwen/DashScope (`qwen-plus`); OpenAI selectable.
+- **Embeddings API key** — ICP semantic scoring. Provider defaults to Qwen `text-embedding-v3`; OpenAI `text-embedding-3-small` selectable.
 
-For each profile the extension captures the profile facts from LinkedIn (headline, current role, experience history, recent posts/comments, and company "About"), then runs three grounded skills:
+Both keys are **AES-GCM encrypted at rest** and never returned to the UI. Press **Save & verify** and the extension stores the key encrypted, runs a live connection test, and shows 🔒 *Configured & connection verified*. Once set, the field shows only `••••••••`; re-enter a value to replace it, or **Clear** to remove it. (The encryption is obfuscation-grade — it keeps keys out of plaintext storage, but is not an OS keychain.)
 
-1. **ICP scoring** — scores the profile 0–100 against `icps.md`.
-2. **Persona framework** (only if score ≥ threshold) — a persona card plus an opportunity score.
-3. **Email outreach** (only if score ≥ threshold) — three distinct outreach messages.
+> DashScope defaults to the **international** endpoint (`dashscope-intl.aliyuncs.com`). If your key is China-region, that verification will fail — tell us and we'll switch the base URL.
 
-The run is durable (survives service-worker restarts via the heartbeat alarm), pauses on LinkedIn checkpoints, and closes its worker tab when finished. Every model prompt is instructed to use only the captured facts and never invent data.
+### Inputs
 
-**Output:** a `lead-url-lens-feed.csv` download whose columns are the source URL plus **ICP Score, Persona Card, Opportunity Score, Outreach 1, Outreach 2, Outreach 3** — the verbatim skill output saved in each row. Use **Download CSV** to re-export (including partial results after a pause or cancel).
+- **Profiles file** — `LINKS_TO_ANALYZE.md`: local file or raw URL. Every `linkedin.com/in/…` or `/sales/lead/…` URL is analyzed, in order, de-duplicated (up to 1000).
+- **ICP definition** — `icps.md`: the two Merged ICPs.
+- **Offer doc** (optional) — grounds persona §5 and the outreach value props.
+- **Threshold** — ICP score (0–100) at/above which persona + outreach run. Default 60.
 
-The skill prompts live in `feed.js` (`icpScoringPrompt`, `personaPrompt`, `outreachPrompt`) and can be edited in place to match your own ICP-scoring, persona, and outreach definitions. ICP scoring uses an LLM rubric grounded in the captured facts; swap in a cosine-embeddings pre-filter there if you prefer true embeddings (add an embeddings key).
+### Per profile
+
+1. **ICP scoring** (skill: `icp-scoring`) — captures the Minimal Semantic Payload + company headcount (cached by company name), embeds it, and computes the score **entirely in code** (semantic cosine ×60 + headcount 25 + location/industry 15). No LLM touches the math — this is both the skill rule and the efficient path. Produces the verbatim **LinkedIn Profile ICP Analysis Report**.
+2. **Persona + outreach** (skills: `persona-framework` + `email-outreach`) — only when the score ≥ threshold. A **single Qwen call** builds the full 6-section Persona Card with the 30/40/30 Opportunity Score, then the three French emails (Pattern Interrupt / Value-Add Nudge / Diagnostic Break-up), grounded in the persona card, the offer, and only observed facts. Posts/comments follow the skill's X=5 / 12−X=7 rule.
+
+The run is durable (survives service-worker restarts via the heartbeat alarm), pauses on LinkedIn checkpoints, and closes its worker tab when finished.
+
+**Output:** `lead-url-lens-feed.csv` — the source URL plus **ICP Score** (the full analysis report), **Persona Card**, **Opportunity Score**, **Outreach 1/2/3** — verbatim skill output per row. **Download CSV** re-exports (including partial results after a pause or cancel).
+
+The scoring math, structural rules, ICP keyword vectors, and prompt templates live in `feed.js` (`computeIcp`, `buildIcpReport`, `personaOutreachPrompt`, `ICP1_VECTOR_TEXT` / `ICP2_VECTOR_TEXT`) and can be edited in place.

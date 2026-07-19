@@ -1,5 +1,6 @@
 /* TechNFirms Lead URL Lens — user initiated, durable, inactive-tab, checkpoint safe. */
-import {parseProfileLinks, factsForProfile, icpScoringPrompt, personaPrompt, outreachPrompt, callLLM, extractJson, buildFeedCsv, csvDataUrl} from "./feed.js";
+import {parseProfileLinks, factsForProfile, profileEmbeddingText, computeIcp, verdictBand, buildIcpReport, personaOutreachPrompt, chatLLM, embed, extractJson, buildFeedCsv, csvDataUrl, encryptSecret, decryptSecret, ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT} from "./feed.js";
+const feedHeadcountCache = new Map();
 const MAX_TARGET = 500;
 const FEED_MAX = 1000;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -277,7 +278,8 @@ async function enrichQueue({importId, limit, resume = false, maxSteps = Infinity
 }
 
 /* ----------------------------------------------------------------- Feed workflow */
-async function feedConfig(){return (await chrome.storage.local.get("feedConfig")).feedConfig || {};}
+async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {chatProvider:c.chatProvider||"qwen",chatModel:c.chatModel||"",embedProvider:c.embedProvider||"qwen",embedModel:c.embedModel||"",threshold:Number.isFinite(Number(c.threshold))?Number(c.threshold):60,icpText:c.icpText||"",offerText:c.offerText||""};}
+async function feedSecret(kind){const s=(await chrome.storage.local.get("feedSecrets")).feedSecrets||{};return decryptSecret(s[kind]);}
 function feedString(value){return typeof value==="string"?value:(value==null?"":JSON.stringify(value));}
 async function captureProfileForFeed(tabId, profileUrl){
   const data = await captureProfileSurface(tabId, profileUrl);
@@ -286,36 +288,40 @@ async function captureProfileForFeed(tabId, profileUrl){
     return {ok:false, error_code:data?.error_code||"profile_validation_failed", error_message:data?.error_message||(data?.validation?.errors||[]).join(", ")};
   }
   // Best-effort recent activity + company facts — strengthens outreach, never blocks the row.
-  try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/posts/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const posts=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"post",limit:7}).catch(()=>[]);data.posts=Array.isArray(posts)?posts.slice(0,7):[];}catch{data.posts=[];}
-  try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/comments/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const comments=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"comment",limit:5}).catch(()=>[]);data.comments=Array.isArray(comments)?comments.slice(0,5):[];}catch{data.comments=[];}
+  try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/posts/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const posts=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"post",limit:5}).catch(()=>[]);data.posts=Array.isArray(posts)?posts.slice(0,5):[];}catch{data.posts=[];}
+  try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/comments/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const comments=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"comment",limit:7}).catch(()=>[]);data.comments=Array.isArray(comments)?comments.slice(0,7):[];}catch{data.comments=[];}
   if(data.company_profile_url){try{await chrome.tabs.update(tabId,{url:data.company_profile_url.replace(/\/$/,"")+"/about/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const company=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_COMPANY"}).catch(()=>null);if(company&&!company.blocked)data.company_page=company;}catch{}}
   return {ok:true, data};
 }
-async function analyzeFeedProfile(url, cfg){
+async function analyzeFeedProfile(url, ctx){
   const worker = await acquireLinkedInWorkerTab(url);
   const captured = await captureProfileForFeed(worker.tab.id, url);
   if(captured.checkpoint) return {checkpoint:true};
-  const row = {url, icp_score:"", persona_card:"", opportunity_score:"", outreach_1:"", outreach_2:"", outreach_3:"", raw:{}};
-  if(!captured.ok){row.icp_score="error";row.persona_card=`CAPTURE_FAILED: ${captured.error_code||"unknown"} ${captured.error_message||""}`.trim();return {row};}
+  const row = {url, icp_score:"", icp_total:null, persona_card:"", opportunity_score:"", outreach_1:"", outreach_2:"", outreach_3:"", raw:{}};
+  if(!captured.ok){row.icp_score=`CAPTURE_FAILED: ${captured.error_code||"unknown"} ${captured.error_message||""}`.trim();return {row};}
   const facts = factsForProfile(captured.data);
-  const llm = opts => callLLM({provider:cfg.provider, apiKey:cfg.apiKey, model:cfg.model, ...opts});
-  // Skill 1 — ICP scoring (embeddings-grounded rubric)
-  const scoreText = await llm(icpScoringPrompt(cfg.icpText, facts));
-  const score = extractJson(scoreText) || {};
-  const icpScore = Number.isFinite(Number(score.icp_score)) ? Math.round(Number(score.icp_score)) : "";
-  row.icp_score = icpScore; row.raw.icp = scoreText;
-  if(icpScore==="" || icpScore < cfg.threshold) return {row};
-  // Skill 2 — persona framework
-  const persoText = await llm(personaPrompt(cfg.icpText, facts));
-  const perso = extractJson(persoText) || {};
-  row.persona_card = feedString(perso.persona_card);
-  row.opportunity_score = Number.isFinite(Number(perso.opportunity_score)) ? Math.round(Number(perso.opportunity_score)) : "";
-  row.raw.persona = persoText;
-  // Skill 3 — email outreach
-  const outText = await llm(outreachPrompt(cfg.icpText, facts, row.persona_card));
-  const out = extractJson(outText) || {};
-  row.outreach_1 = feedString(out.outreach_1); row.outreach_2 = feedString(out.outreach_2); row.outreach_3 = feedString(out.outreach_3);
-  row.raw.outreach = outText;
+  // icp-scoring Phase 1 — company headcount cache
+  let cacheStatus="MISS & UPDATED";
+  const cname=(facts.current_company||"").trim().toLowerCase();
+  if(cname){if(ctx.cache.has(cname)){cacheStatus="HIT";if(!facts.company.size)facts.company.size=ctx.cache.get(cname);}else if(facts.company.size){ctx.cache.set(cname,facts.company.size);}}
+  // icp-scoring Phase 2/4 — embeddings cosine, ALL math in code
+  let profileVec;
+  try{[profileVec]=await embed([profileEmbeddingText(facts)],{provider:ctx.cfg.embedProvider,apiKey:ctx.embedKey,model:ctx.cfg.embedModel});}
+  catch(e){row.icp_score=`ICP_EMBED_ERROR: ${e.message}`;return {row};}
+  const r=computeIcp(facts, profileVec, ctx.icp1Vec, ctx.icp2Vec);
+  const report=buildIcpReport(facts, r, cacheStatus);
+  row.icp_score=report; row.icp_total=r.total; row.raw.icp={total:r.total,verdict:verdictBand(r.total),s1:r.s1,s2:r.s2};
+  if(r.total < ctx.cfg.threshold){row.persona_card=`Below threshold (${r.total} < ${ctx.cfg.threshold}) — persona & outreach not generated.`;return {row};}
+  // persona-framework + email-outreach — single combined Qwen call (max efficiency)
+  const {system,user,max_tokens}=personaOutreachPrompt(ctx.cfg.icpText, ctx.cfg.offerText, facts, report);
+  let text;
+  try{text=await chatLLM({provider:ctx.cfg.chatProvider,apiKey:ctx.qwenKey,model:ctx.cfg.chatModel,system,user,max_tokens});}
+  catch(e){row.persona_card=`PERSONA_OUTREACH_ERROR: ${e.message}`;return {row};}
+  const parsed=extractJson(text)||{};
+  row.persona_card=feedString(parsed.persona_card);
+  row.opportunity_score=Number.isFinite(Number(parsed.opportunity_score))?Math.round(Number(parsed.opportunity_score)):"";
+  row.outreach_1=feedString(parsed.outreach_1); row.outreach_2=feedString(parsed.outreach_2); row.outreach_3=feedString(parsed.outreach_3);
+  row.raw.persona_outreach=text;
   return {row};
 }
 async function finishFeed(state, stopReason){
@@ -324,22 +330,30 @@ async function finishFeed(state, stopReason){
   try{const csv=buildFeedCsv(results);await chrome.storage.local.set({feedCsv:csv});await chrome.downloads.download({url:csvDataUrl(csv), filename:"lead-url-lens-feed.csv", saveAs:false});downloadOk=true;}
   catch(error){downloadError=error?.message||"download_failed";}
   await closeWorkerTab();
-  const qualified = results.filter(r=>r.persona_card && !String(r.persona_card).startsWith("CAPTURE_FAILED")).length;
+  const qualified = results.filter(r=>Number.isFinite(Number(r.opportunity_score))).length;
   await save({running:false, stage:downloadOk?"DONE":"FAILED", stop_reason:stopReason,
     message: downloadOk ? `Feed complete · ${results.length} rows · ${qualified} qualified (≥${state.feedThreshold}) · CSV downloaded`
       : `Feed finished but CSV export failed: ${downloadError}. Use Download CSV to retry.`});
 }
 async function runFeed({resume=false}={}){
   const cfg = await feedConfig();
+  const qwenKey = await feedSecret("qwen");
+  const embedKey = await feedSecret("embeddings");
   const state = await stored();
   let results = resume ? (state.feedResults||[]) : [];
   let index = resume ? Number(state.feedIndex||0) : 0;
   const urls = state.feedUrls || [];
   if(!Array.isArray(urls) || !urls.length){await save({running:false, stage:"FAILED", message:"No LinkedIn profile URLs were found in the file."}); return;}
-  if(!cfg.apiKey){await save({running:false, stage:"FAILED", message:"Enter an LLM API key before running the Feed workflow."}); return;}
+  if(!qwenKey){await save({running:false, stage:"FAILED", message:"Set & verify the Qwen API key before running Feed."}); return;}
+  if(!embedKey){await save({running:false, stage:"FAILED", message:"Set & verify the Embeddings API key before running Feed."}); return;}
   await save({mode:"feed", running:true, paused:false, cancelled:false, feedUrls:urls, feedIndex:index, feedResults:results,
     feedThreshold:cfg.threshold, total:urls.length, done:results.length, stage:"PROCESSING",
-    message: resume?"Resuming Feed analysis…":`Analyzing ${urls.length} profile(s)…`});
+    message: resume?"Resuming Feed analysis…":"Embedding the two ICP vectors…"});
+  let icp1Vec, icp2Vec;
+  try{[icp1Vec, icp2Vec] = await embed([ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT], {provider:cfg.embedProvider, apiKey:embedKey, model:cfg.embedModel});}
+  catch(e){await save({running:false, stage:"FAILED", message:`Embeddings call failed: ${e.message}`}); return;}
+  if(!Array.isArray(icp1Vec)||!Array.isArray(icp2Vec)){await save({running:false, stage:"FAILED", message:"Embeddings provider returned no vectors for the ICPs."}); return;}
+  const ctx = {qwenKey, embedKey, cfg, icp1Vec, icp2Vec, cache:feedHeadcountCache};
   let stopReason="batch_complete";
   try{
     while(index < urls.length){
@@ -348,8 +362,8 @@ async function runFeed({resume=false}={}){
       const url = urls[index];
       await save({stage:"ANALYZE", message:`Analyzing ${index+1}/${urls.length}: ${url}`});
       let outcome;
-      try{outcome = await analyzeFeedProfile(url, cfg);}
-      catch(error){outcome = {row:{url, icp_score:"error", persona_card:`ERROR: ${error?.message||"analysis_failed"}`, opportunity_score:"", outreach_1:"", outreach_2:"", outreach_3:"", raw:{}}};}
+      try{outcome = await analyzeFeedProfile(url, ctx);}
+      catch(error){outcome = {row:{url, icp_score:`ERROR: ${error?.message||"analysis_failed"}`, icp_total:null, persona_card:"", opportunity_score:"", outreach_1:"", outreach_2:"", outreach_3:"", raw:{}}};}
       if(outcome.checkpoint){await save({paused:true, stage:"BLOCKED", message:"LinkedIn security checkpoint detected. Resolve it in the worker tab, then press Resume."}); return;}
       results = [...results, outcome.row]; index += 1;
       await save({feedResults:results, feedIndex:index, done:results.length, message:`Analyzed ${index}/${urls.length}`});
@@ -369,14 +383,38 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
   if (message.type === "RESUME_OPERATION") { await save({paused: false, message: "Resuming from the last durable checkpoint…"});await resumeDurableOperation();return {ok: true}; }
   if (message.type === "CANCEL_OPERATION") { const state=await save({cancelled:true,running:false,paused:false,stage:"CANCELLED",message:"Cancelled. Any active contact is returning to the queue."});if(state.mode==="enrichment"){await releaseLease(state.currentJob,state.run_id);await closeWorkerTab();await finishRun(state.run_id,"cancelled","cancelled",{done:Number(state.done||0),failed:Number(state.failed||0)})}else if(state.mode==="feed"){await closeWorkerTab()}return {ok: true}; }
   if(message.type==="OPEN_CRM"){await chrome.tabs.create({url:message.url});return{ok:true}}
+  if(message.type==="SET_FEED_KEY"){
+    const kind=message.kind; if(!["qwen","embeddings"].includes(kind))return{ok:false,error:"Unknown key."};
+    const value=String(message.value||"").trim(); if(!value)return{ok:false,error:"Enter a key value."};
+    const secrets=(await chrome.storage.local.get("feedSecrets")).feedSecrets||{};
+    secrets[kind]=await encryptSecret(value);
+    const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
+    if(kind==="qwen"){cfg.chatProvider=message.provider||cfg.chatProvider||"qwen";cfg.chatModel=String(message.model||cfg.chatModel||"").trim();}
+    else{cfg.embedProvider=message.provider||cfg.embedProvider||"qwen";cfg.embedModel=String(message.model||cfg.embedModel||"").trim();}
+    await chrome.storage.local.set({feedSecrets:secrets,feedConfig:cfg});
+    let verified=false,error="";
+    try{
+      if(kind==="qwen"){await chatLLM({provider:cfg.chatProvider,apiKey:value,model:cfg.chatModel,system:"You are a connection test.",user:"Reply with OK.",max_tokens:5});verified=true;}
+      else{const v=await embed(["connection test"],{provider:cfg.embedProvider,apiKey:value,model:cfg.embedModel});verified=Array.isArray(v)&&Array.isArray(v[0])&&v[0].length>0;if(!verified)error="Provider returned no embedding vector.";}
+    }catch(e){error=e.message;}
+    const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
+    meta[kind]={set:true,verified}; await chrome.storage.local.set({feedKeyMeta:meta});
+    return{ok:true,verified,error};
+  }
+  if(message.type==="GET_FEED_KEY_STATUS"){const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};const cfg=await feedConfig();return{ok:true,meta,cfg:{chatProvider:cfg.chatProvider,chatModel:cfg.chatModel,embedProvider:cfg.embedProvider,embedModel:cfg.embedModel}};}
+  if(message.type==="CLEAR_FEED_KEY"){const kind=message.kind;const s=(await chrome.storage.local.get("feedSecrets")).feedSecrets||{};const m=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};delete s[kind];delete m[kind];await chrome.storage.local.set({feedSecrets:s,feedKeyMeta:m});return{ok:true};}
   if(message.type==="START_FEED"){
     const state=await stored(); if(state.running)return{ok:false,error:"An operation is already running."};
     const urls=parseProfileLinks(message.linksText||"");
     if(!urls.length)return{ok:false,error:"No LinkedIn profile URLs found in the file or link."};
-    if(!String(message.apiKey||"").trim())return{ok:false,error:"Enter an LLM API key first."};
+    const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
+    if(!meta.qwen?.set)return{ok:false,error:"Set the Qwen API key first."};
+    if(!meta.embeddings?.set)return{ok:false,error:"Set the Embeddings API key first."};
     const threshold=Math.max(0,Math.min(100,Number(message.threshold)||60));
-    await chrome.storage.local.set({feedConfig:{provider:message.provider||"anthropic",apiKey:message.apiKey,model:String(message.model||"").trim(),icpText:String(message.icpText||""),threshold}});
+    const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
+    await chrome.storage.local.set({feedConfig:{...cfg,chatProvider:message.chatProvider||cfg.chatProvider||"qwen",chatModel:String(message.chatModel||cfg.chatModel||"").trim(),embedProvider:message.embedProvider||cfg.embedProvider||"qwen",embedModel:String(message.embedModel||cfg.embedModel||"").trim(),threshold,icpText:String(message.icpText||""),offerText:String(message.offerText||"")}});
     await chrome.storage.local.remove("feedCsv");
+    feedHeadcountCache.clear();
     await save({mode:"feed",feedUrls:urls.slice(0,FEED_MAX),feedIndex:0,feedResults:[],feedThreshold:threshold,total:urls.length,done:0,running:false,paused:false,cancelled:false,stage:"QUEUED",message:`Queued ${urls.length} profile(s) for Feed analysis`});
     wakeLock=true; runFeed({}).finally(()=>wakeLock=false);
     return{ok:true,count:urls.length};

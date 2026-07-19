@@ -1,16 +1,19 @@
-/* TechNFirms Lead URL Lens — Feed pipeline helpers.
+/* TechNFirms Lead URL Lens — Feed pipeline (recruitment-niche skills).
  *
- * Pure, side-effect-free logic for the "Feed" workflow: parse a LINKS_TO_ANALYZE.md
- * file into LinkedIn profile URLs, score each captured profile against an ICP
- * definition, and — for qualifying profiles — build a persona card and three
- * outreach messages. All model reasoning is grounded strictly in the facts the
- * extension captured from LinkedIn; the prompts forbid inventing data.
+ * Implements three skills faithfully, tuned for maximum efficiency:
+ *   - icp-scoring       → embeddings cosine + hard structural rules, ALL math in
+ *                         code (never the LLM), producing the standardized
+ *                         "LinkedIn Profile ICP Analysis Report".
+ *   - persona-framework → 6-section Persona Card + 30/40/30 Opportunity Score.
+ *   - email-outreach    → 3 French emails (Pattern Interrupt / Value-Add Nudge /
+ *                         Diagnostic Break-up).
  *
- * The three "skills" are implemented here as editable prompt builders so their
- * output can be saved verbatim per row:
- *   - icpScoringPrompt      → ICP Score          (skill: icp-profile-scoring)
- *   - personaPrompt         → Persona Card + Opportunity Score (skill: persona-framework)
- *   - outreachPrompt        → Outreach 1/2/3      (skill: email-outreach)
+ * Efficiency: ICP scoring costs only embeddings (2 ICP vectors embedded once per
+ * run + 1 per profile). LLM (Qwen) reasoning runs ONLY for profiles at/above the
+ * threshold, and persona + the 3 emails are produced in a SINGLE combined call.
+ *
+ * Secrets (Qwen key, Embeddings key) are AES-GCM encrypted at rest and never
+ * returned to the UI. See encryptSecret / decryptSecret.
  */
 
 export const FEED_CSV_HEADERS = [
@@ -23,24 +26,20 @@ export const FEED_CSV_HEADERS = [
   "Outreach 3",
 ];
 
-/* ------------------------------------------------------------------ parsing */
+/* ICP keyword vectors — verbatim from the icp-scoring skill (Phase 2). */
+export const ICP1_VECTOR_TEXT = "Fondateur, Co-fondateur, Gérant, Managing Partner, Directeur d'agence, Directeur des Opérations, cabinet de recrutement, chasseur de tête, conseil en recrutement, croissance, IA, automatisation, RGPD, conformité";
+export const ICP2_VECTOR_TEXT = "Associé, Partner, Fondateur, Directeur de cabinet, Directeur Général, cabinet de chasse, executive search, recherche de cadres, headhunting, cabinet de recrutement spécialisé, nous recrutons, développement, digital";
 
-// Extract canonical LinkedIn profile URLs from a Markdown / text file, in order,
-// de-duplicated. Handles bare URLs, Markdown links [text](url), and list items.
+/* ------------------------------------------------------------------ parsing */
 export function parseProfileLinks(text) {
-  const urls = [];
-  const seen = new Set();
+  const urls = [], seen = new Set();
   const pattern = /https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/(?:in\/[^\s)"'<>]+|sales\/lead\/[^\s)"'<>]+)/gi;
   for (const raw of String(text || "").match(pattern) || []) {
     const canonical = canonicalProfileUrl(raw);
-    if (canonical && !seen.has(canonical)) {
-      seen.add(canonical);
-      urls.push(canonical);
-    }
+    if (canonical && !seen.has(canonical)) { seen.add(canonical); urls.push(canonical); }
   }
   return urls;
 }
-
 export function canonicalProfileUrl(raw) {
   try {
     const url = new URL(String(raw).trim());
@@ -49,17 +48,12 @@ export function canonicalProfileUrl(raw) {
     if (standard) return `https://www.linkedin.com/in/${decodeURIComponent(standard[1]).toLowerCase()}`;
     if (sales) return `https://www.linkedin.com/sales/lead/${sales[1]}`;
     return "";
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }
 
 /* ------------------------------------------------------- fact preparation */
-
-// Reduce a captured profile object to the observed facts the model may reason
-// over. Nothing here is invented — every field comes from the DOM capture.
 export function factsForProfile(data = {}) {
-  const facts = {
+  return {
     profile_url: data.profile_url || "",
     full_name: data.full_name || "",
     headline: data.headline || "",
@@ -70,10 +64,8 @@ export function factsForProfile(data = {}) {
     role_start_date: data.role_start_date || "",
     role_description: data.role_description || "",
     experience_history: (data.experience_history || []).slice(0, 8).map(item => ({
-      role: item.role_headline || "",
-      company: item.company || "",
-      start: item.role_start_date || "",
-      end: item.role_is_current ? "present" : (item.role_end_date || ""),
+      role: item.role_headline || "", company: item.company || "",
+      start: item.role_start_date || "", end: item.role_is_current ? "present" : (item.role_end_date || ""),
       description: (item.role_description || "").slice(0, 600),
     })),
     company: data.company_page ? {
@@ -82,152 +74,296 @@ export function factsForProfile(data = {}) {
       size: data.company_page.company_size || "",
       headquarters: data.company_page.headquarters || "",
       website: data.company_page.website || data.company_website_candidate || "",
+      specialties: data.company_page.specialties || "",
       description: (data.company_page.description || "").slice(0, 800),
-    } : { name: data.company || "" },
-    recent_posts: (data.posts || []).map(p => (p.content || "").slice(0, 700)).filter(Boolean).slice(0, 7),
-    recent_comments: (data.comments || []).map(c => (c.content || "").slice(0, 500)).filter(Boolean).slice(0, 5),
+    } : { name: data.company || "", size: "", industry: "", headquarters: "" },
+    recent_posts: (data.posts || []).map(p => (p.content || "").slice(0, 700)).filter(Boolean).slice(0, 5),
+    recent_comments: (data.comments || []).map(c => (c.content || "").slice(0, 500)).filter(Boolean).slice(0, 7),
   };
-  return facts;
 }
 
-/* --------------------------------------------------------------- prompts */
-
-const GROUNDING = "Use ONLY the facts in FACTS. Never invent an employer, headcount, budget, tenure, seniority, or intent that is not present. When a fact is unknown, write \"not observed\" rather than guessing.";
-
-// Skill: icp-profile-scoring
-export function icpScoringPrompt(icpText, facts) {
-  const system = `You score how well a LinkedIn profile fits an Ideal Customer Profile (ICP). ${GROUNDING}
-Return ONLY a JSON object, no prose, no markdown fences:
-{"icp_score": <integer 0-100>, "justification": "<=60 words citing only observed facts>"}
-Score conservatively when facts are sparse. 0 = no fit, 100 = perfect fit.`;
-  const user = `ICP DEFINITION:\n${icpText}\n\nFACTS:\n${JSON.stringify(facts)}`;
-  return { system, user, max_tokens: 600 };
+// Minimal Semantic Payload (icp-scoring Phase 1) as one embeddable string.
+export function profileEmbeddingText(facts) {
+  return [facts.headline, facts.current_role, facts.current_company, facts.role_description,
+    (facts.experience_history || []).map(e => `${e.role} ${e.company}`).join(" ")]
+    .filter(Boolean).join(". ").slice(0, 2000) || facts.full_name || "profile";
 }
 
-// Skill: persona-framework
-export function personaPrompt(icpText, facts) {
-  const system = `You are a B2B persona analyst. Using the persona framework, produce a concise persona card for the prospect. ${GROUNDING}
-Return ONLY a JSON object, no prose, no markdown fences:
-{
-  "persona_card": "<markdown persona card covering: Role & seniority, Likely goals, Likely pains, Buying trigger, Decision role — each line grounded in an observed fact; use 'not observed' where unknown>",
-  "opportunity_score": <integer 0-100>,
-  "opportunity_rationale": "<=40 words, observed facts only>"
+/* --------------------------------------------------- structural validation */
+export function parseHeadcount(text) {
+  if (!text) return null;
+  const cleaned = String(text).replace(/ /g, " ");
+  const nums = (cleaned.replace(/(\d)\s+(\d)/g, "$1$2").match(/\d+/g) || []).map(Number);
+  if (!nums.length) return null;
+  if (nums.length >= 2) return { min: nums[0], max: nums[1] };
+  if (/\+|plus|more|au[- ]?del[àa]/i.test(cleaned)) return { min: nums[0], max: Infinity };
+  return { min: nums[0], max: nums[0] };
 }
-opportunity_score reflects how strong and timely the outreach opportunity is based on observed signals (recent activity, role change, hiring, growth). Be conservative without evidence.`;
-  const user = `ICP DEFINITION:\n${icpText}\n\nFACTS:\n${JSON.stringify(facts)}`;
-  return { system, user, max_tokens: 1500 };
+// icp-scoring Phase 4: ICP target 1-50 (exact 25), 51-200 adjacent (10), >200 none (0).
+export function headcountScore(range) {
+  if (!range) return { points: 0, label: "NO MATCH (unknown)" };
+  if (range.min <= 50) return { points: 25, label: "EXACT" };
+  if (range.min <= 200) return { points: 10, label: "ADJACENT" };
+  return { points: 0, label: "NO MATCH" };
+}
+const FRANCE_RE = /\b(france|paris|lyon|marseille|toulouse|bordeaux|lille|nantes|strasbourg|nice|rennes|montpellier|grenoble|[îi]le[- ]de[- ]france|fran[çc]ais)\b/i;
+const HR_RE = /(ressources humaines|recrutement|recruitment|staffing|chasse de t[êe]te|executive search|human resources|\bhr\b|int[ée]rim|conseil en recrutement|headhunt)/i;
+export function locationIndustryScore(facts) {
+  const c = facts.company || {};
+  const locText = [facts.location, c.headquarters, c.description].filter(Boolean).join(" ");
+  const indText = [c.industry, c.specialties, facts.headline, facts.current_role, c.description, c.name].filter(Boolean).join(" ");
+  const france = FRANCE_RE.test(locText) || FRANCE_RE.test(indText);
+  const industry = HR_RE.test(indText);
+  return { points: france && industry ? 15 : (france || industry ? 5 : 0), france, industry };
 }
 
-// Skill: email-outreach
-export function outreachPrompt(icpText, facts, personaCard) {
-  const system = `You are a B2B outreach copywriter. Write three distinct, personalized outreach messages for the prospect. ${GROUNDING}
-- Message 1: a short connection opener referencing one specific observed fact.
-- Message 2: a value-led follow-up tying the ICP's offer to an observed pain or goal.
-- Message 3: a direct, respectful call-to-action.
-Each message <=90 words. No fabricated claims about the prospect or their company. Do not use bracket placeholders unless the underlying fact is genuinely "not observed".
-Return ONLY a JSON object, no prose, no markdown fences:
-{"outreach_1": "<message 1>", "outreach_2": "<message 2>", "outreach_3": "<message 3>"}`;
-  const user = `ICP DEFINITION:\n${icpText}\n\nPERSONA CARD:\n${personaCard}\n\nFACTS:\n${JSON.stringify(facts)}`;
-  return { system, user, max_tokens: 1800 };
+export function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0, n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
 }
 
-/* --------------------------------------------------------------- LLM call */
+// Compute the full ICP score in CODE (skill rule: the LLM never calculates scores).
+export function computeIcp(facts, profileVec, icp1Vec, icp2Vec) {
+  const s1 = cosine(profileVec, icp1Vec), s2 = cosine(profileVec, icp2Vec);
+  const maxSem = Math.max(0, Math.min(1, Math.max(s1, s2)));
+  const semantic = Math.round(maxSem * 60);
+  const range = parseHeadcount(facts.company?.size);
+  const hc = headcountScore(range);
+  const li = locationIndustryScore(facts);
+  return {
+    s1: Math.max(0, s1), s2: Math.max(0, s2), maxSem, semantic,
+    headcount: hc.points, headcountLabel: hc.label,
+    locind: li.points, france: li.france, industry: li.industry,
+    total: Math.round(semantic + hc.points + li.points),
+    primary: s1 >= s2 ? "ICP 1 (Scaling Cabinet)" : "ICP 2 (Niche/Exec Search)",
+  };
+}
+export function verdictBand(total) {
+  if (total >= 80) return "HOT"; if (total >= 60) return "WARM"; if (total >= 40) return "COLD"; return "REJECT";
+}
+function icpRecommendation(v, r) {
+  const miss = [];
+  if (r.headcount < 25) miss.push("headcount outside 1-50");
+  if (!r.france) miss.push("location not confirmed in France");
+  if (!r.industry) miss.push("industry not clearly HR/recruitment");
+  if (r.semantic < 36) miss.push("weak semantic alignment");
+  const gap = miss.length ? ` Watch-out: ${miss.join("; ")}.` : "";
+  const angle = { HOT: "Immediate personalised outreach referencing their strongest ICP signal.",
+    WARM: "Cautious outreach; lead with the ICP match and address the gap.",
+    COLD: "Nurture only; engage with their content before any pitch.",
+    REJECT: "Discard — not an ICP match." }[v];
+  return `${angle}${gap}`;
+}
+export function buildIcpReport(facts, r, cacheStatus) {
+  const v = verdictBand(r.total);
+  const c = facts.company || {};
+  return `====================================================================
+ LINKEDIN PROFILE ICP ANALYSIS REPORT
+====================================================================
+1. PROFILE IDENTITY & EXTRACTED DATA
+- Full Name: ${facts.full_name || "N/A"}
+- Current Title: ${facts.current_role || facts.headline || "N/A"}
+- Company Name: ${facts.current_company || "N/A"}
+- Profile Preview/Description Summary: ${(facts.headline || "N/A").slice(0, 220)}
+- Minimal Semantic Payload Extracted: ${profileEmbeddingText(facts).slice(0, 240)}
 
-// Call the configured LLM provider and return the assistant's text.
-// Supported providers: "anthropic" (default), "openai".
-export async function callLLM({ provider = "anthropic", apiKey, model, system, user, max_tokens = 1024 }) {
-  if (!apiKey) throw new Error("LLM API key is required for the Feed workflow.");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 120000);
-  try {
-    if (provider === "openai") {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: model || "gpt-4o",
-          max_tokens,
-          messages: [{ role: "system", content: system }, { role: "user", content: user }],
-        }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error?.message || `OpenAI error ${response.status}`);
-      return payload?.choices?.[0]?.message?.content || "";
-    }
-    // Anthropic (default)
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+2. COMPANY CONTEXT & CACHE STATUS
+- Company Name: ${facts.current_company || "N/A"}
+- Employee Count: ${c.size || "Unknown"}
+- Cache Status: ${cacheStatus || "MISS & UPDATED"}
+- Industry Detected: ${c.industry || (r.industry ? "HR/Recruitment (inferred)" : "Unknown")}
+- Location Detected: ${facts.location || c.headquarters || "Unknown"}
+
+3. SEMANTIC EMBEDDING ANALYSIS
+- Vector ICP 1 (Scaling Cabinet) Similarity: ${r.s1.toFixed(2)}
+- Vector ICP 2 (Niche/Exec Search) Similarity: ${r.s2.toFixed(2)}
+- Primary ICP Match: ${r.primary}
+- Semantic Alignment Notes: max cosine ${r.maxSem.toFixed(2)} -> ${r.semantic}/60
+
+4. STRUCTURAL VALIDATION (HARD FILTERS)
+- Location Match (France): ${r.france ? "YES" : "NO"}
+- Industry Match (HR/Recruitment): ${r.industry ? "YES" : "NO"}
+- Headcount Match (1-50 or 11-50): ${r.headcountLabel}
+
+5. FINAL ICP SCORE & VERDICT
+- Semantic Score: ${r.semantic} / 60
+- Headcount Score: ${r.headcount} / 25
+- Location/Industry Score: ${r.locind} / 15
+--------------------------------------------------------------------
+TOTAL ICP SCORE: [ ${r.total} / 100 ]
+====================================================================
+ACTIONABLE VERDICT: ${v}
+AGENT RECOMMENDATION:
+${icpRecommendation(v, r)}
+====================================================================`;
+}
+
+/* ------------------------------------------------- persona + outreach prompt */
+const PERSONA_TEMPLATE = `SECTION 1: CORE IDENTITY & PROFESSIONAL DNA
+- Full Name:
+- Current Title:
+- Company:
+- Company Size & Industry:
+- Location:
+- Tenure in Current Role:
+- Career Trajectory Summary:
+- Core KPIs / Responsibilities:
+
+SECTION 2: BEHAVIORAL & MINDSET PROFILE (Phase 2)
+- Content Themes (from X posts):
+- Communication Style & Tone:
+- Peer Interaction & Values (from 12-X comments):
+- Stated Beliefs / Philosophies:
+
+SECTION 3: ORGANIZATIONAL CONTEXT (Phase 3)
+- Company Value Proposition:
+- Strategic Focus / Current Goals:
+- Company Culture & Vibe:
+- Internal Gaps / Hiring Needs:
+- Tech Stack / Tools Mentioned:
+
+SECTION 4: PAIN POINTS & BUYING TRIGGERS
+- Primary Operational Pains:
+- Strategic / Business Pains:
+- Hidden Objections / Fears:
+- Recent Trigger Events:
+
+SECTION 5: ALIGNMENT WITH OUR OFFER
+- Dream Outcome for THIS Persona:
+- How Our Offer Solves Their Specific Pain:
+- Required Proof to Convert:
+
+SECTION 6: THE OPPORTUNITY SCORE (0-100) — calculate last
+- ICP Fit Score: [__/30]
+- Pain & Trigger Score: [__/40]
+- Authority & Budget Score: [__/30]
+- TOTAL OPPORTUNITY SCORE: [ XX / 100 ]
+
+Final Strategic Note: [1-2 sentences on the single best angle to approach this person]`;
+
+// One combined call → Persona Card + Opportunity Score + the 3 outreach emails.
+export function personaOutreachPrompt(icpText, offerText, facts, icpReport) {
+  const system = `You are a B2B research + copywriting agent selling the French "Recruteur Augmenté" AI offer to recruitment cabinets. Ground everything in the FACTS, the ICP DEFINITION, the ICP REPORT, and the OFFER. Use ONLY observed facts — never invent an employer, headcount, tenure, budget, or intent. Where data is missing, write "Data unavailable, inferred as [X]" rather than omitting the field.
+
+STEP 1 — Persona Card. Fill EVERY field of this exact template and section headings; behavioral fields draw on the ~5 recent posts and ~7 comments in FACTS:
+${PERSONA_TEMPLATE}
+Compute SECTION 6 LAST: ICP Fit /30, Pain & Trigger Alignment /40, Authority & Budget /30 → total /100.
+
+STEP 2 — Three cold emails in FRENCH, peer-to-peer tone ("nous avons remarqué", "beaucoup de gérants nous disent"), each a Subject line then body. Fill the hook from persona §2/§3, the pain from §4, the proof from §5, and tie value to the Offer's dream outcome + CNIL/RGPD compliance and the "10h/semaine" gain:
+- outreach_1 "Pattern Interrupt": 3-second hook proving research, specific value prop (≈60% admin time, CNIL fear), humility ("l'objectif n'est pas de remplacer vos consultants"), low-friction 15-min CTA.
+- outreach_2 "Value-Add Nudge" (3-4 days later): shorter, a diagnostic question, offer a "exemple concret de 2 minutes", "sinon, aucun souci".
+- outreach_3 "Diagnostic Break-up" (5-7 days later): graceful close, loss aversion ("je clos ce dossier"), door left open.
+
+Return ONLY a JSON object, no markdown fences:
+{"persona_card":"<full persona card text>","opportunity_score":<integer 0-100>,"outreach_1":"<Subject: … + body>","outreach_2":"<Subject: … + body>","outreach_3":"<Subject: … + body>"}`;
+  const user = `ICP DEFINITION:\n${icpText || "(not provided)"}\n\nOFFER:\n${offerText || "(not provided)"}\n\nICP REPORT:\n${icpReport}\n\nFACTS:\n${JSON.stringify(facts)}`;
+  return { system, user, max_tokens: 4000 };
+}
+
+/* --------------------------------------------------------------- LLM + embeddings */
+const CHAT = {
+  qwen: { url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", model: "qwen-plus" },
+  openai: { url: "https://api.openai.com/v1/chat/completions", model: "gpt-4o-mini" },
+};
+const EMBED = {
+  qwen: { url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings", model: "text-embedding-v3" },
+  openai: { url: "https://api.openai.com/v1/embeddings", model: "text-embedding-3-small" },
+};
+
+async function timedFetch(url, options, ms = 120000) {
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), ms);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  catch (e) { if (e?.name === "AbortError") throw new Error("Request timed out."); throw e; }
+  finally { clearTimeout(timer); }
+}
+
+// Chat completion. providers: "qwen" (default), "openai", "anthropic".
+export async function chatLLM({ provider = "qwen", apiKey, model, system, user, max_tokens = 1024 }) {
+  if (!apiKey) throw new Error("LLM API key is required.");
+  if (provider === "anthropic") {
+    const r = await timedFetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      signal: controller.signal,
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify({
-        model: model || "claude-opus-4-8",
-        max_tokens,
-        system,
-        messages: [{ role: "user", content: user }],
-      }),
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+      body: JSON.stringify({ model: model || "claude-opus-4-8", max_tokens, system, messages: [{ role: "user", content: user }] }),
     });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload?.error?.message || `Anthropic error ${response.status}`);
-    return (payload?.content || []).filter(block => block.type === "text").map(block => block.text).join("").trim();
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error("LLM request timed out after 120s.");
-    throw error;
-  } finally {
-    clearTimeout(timer);
+    const p = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(p?.error?.message || `Anthropic error ${r.status}`);
+    return (p?.content || []).filter(b => b.type === "text").map(b => b.text).join("").trim();
   }
+  const cfg = CHAT[provider] || CHAT.qwen;
+  const r = await timedFetch(cfg.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model: model || cfg.model, max_tokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+  });
+  const p = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(p?.error?.message || p?.message || `${provider} error ${r.status}`);
+  return (p?.choices?.[0]?.message?.content || "").trim();
 }
 
-// Parse a JSON object out of a model response, tolerating markdown fences or
-// leading prose. Returns null if nothing parseable is found.
+// Embeddings. providers: "qwen" (text-embedding-v3), "openai" (text-embedding-3-small).
+export async function embed(texts, { provider = "qwen", apiKey, model } = {}) {
+  if (!apiKey) throw new Error("Embeddings API key is required.");
+  const cfg = EMBED[provider] || EMBED.qwen;
+  const r = await timedFetch(cfg.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model: model || cfg.model, input: texts }),
+  }, 60000);
+  const p = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(p?.error?.message || p?.message || `embeddings error ${r.status}`);
+  const data = p?.data || [];
+  return data.map(d => d.embedding);
+}
+
 export function extractJson(text) {
   if (!text) return null;
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = fenced ? fenced[1] : text;
-  try {
-    return JSON.parse(candidate.trim());
-  } catch {}
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    try {
-      return JSON.parse(candidate.slice(start, end + 1));
-    } catch {}
-  }
+  try { return JSON.parse(candidate.trim()); } catch {}
+  const start = candidate.indexOf("{"), end = candidate.lastIndexOf("}");
+  if (start >= 0 && end > start) { try { return JSON.parse(candidate.slice(start, end + 1)); } catch {} }
   return null;
 }
 
 /* --------------------------------------------------------------- CSV */
-
-function csvCell(value) {
-  const s = value === null || value === undefined ? "" : String(value);
+function csvCell(v) {
+  const s = v === null || v === undefined ? "" : String(v);
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
-
-// Build the enriched CSV. Each row maps 1:1 to a LINKS_TO_ANALYZE.md URL and
-// carries the verbatim skill output in its cell.
 export function buildFeedCsv(rows) {
   const lines = [FEED_CSV_HEADERS.map(csvCell).join(",")];
   for (const row of rows) {
-    lines.push([
-      row.url,
-      row.icp_score,
-      row.persona_card,
-      row.opportunity_score,
-      row.outreach_1,
-      row.outreach_2,
-      row.outreach_3,
-    ].map(csvCell).join(","));
+    lines.push([row.url, row.icp_score, row.persona_card, row.opportunity_score, row.outreach_1, row.outreach_2, row.outreach_3].map(csvCell).join(","));
   }
-  // Prepend a UTF-8 BOM so Excel opens accented characters correctly.
   return "﻿" + lines.join("\r\n");
 }
+export function csvDataUrl(csv) { return "data:text/csv;charset=utf-8," + encodeURIComponent(csv); }
 
-export function csvDataUrl(csv) {
-  return "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+/* ------------------------------------------------ secret encryption (AES-GCM) */
+async function getWrapKey() {
+  const store = await chrome.storage.local.get("__lulWrap");
+  let raw = store.__lulWrap;
+  if (!raw) {
+    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+    const exported = new Uint8Array(await crypto.subtle.exportKey("raw", key));
+    raw = btoa(String.fromCharCode(...exported));
+    await chrome.storage.local.set({ __lulWrap: raw });
+  }
+  const bytes = Uint8Array.from(atob(raw), c => c.charCodeAt(0));
+  return crypto.subtle.importKey("raw", bytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+export async function encryptSecret(plain) {
+  const key = await getWrapKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(String(plain))));
+  return { iv: btoa(String.fromCharCode(...iv)), ct: btoa(String.fromCharCode(...ct)) };
+}
+export async function decryptSecret(obj) {
+  if (!obj || !obj.iv || !obj.ct) return "";
+  const key = await getWrapKey();
+  const iv = Uint8Array.from(atob(obj.iv), c => c.charCodeAt(0));
+  const ct = Uint8Array.from(atob(obj.ct), c => c.charCodeAt(0));
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct));
 }
