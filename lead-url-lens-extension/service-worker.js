@@ -1,5 +1,5 @@
 /* TechNFirms Lead URL Lens — user initiated, durable, inactive-tab, checkpoint safe. */
-import {parseProfileLinks, factsForProfile, profileEmbeddingText, computeIcp, verdictBand, buildIcpReport, personaOutreachPrompt, chatLLM, embed, extractJson, buildFeedCsv, csvDataUrl, encryptSecret, decryptSecret, ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT} from "./feed.js";
+import {parseProfileLinks, factsForProfile, profileEmbeddingText, computeIcp, verdictBand, buildIcpReport, personaOutreachPrompt, chatLLM, embed, extractJson, buildFeedCsv, csvDataUrl, deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier, checkVerifier, KDF_ITERATIONS, ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT} from "./feed.js";
 const feedHeadcountCache = new Map();
 const MAX_TARGET = 500;
 const FEED_MAX = 1000;
@@ -278,8 +278,12 @@ async function enrichQueue({importId, limit, resume = false, maxSteps = Infinity
 }
 
 /* ----------------------------------------------------------------- Feed workflow */
-async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {chatProvider:c.chatProvider||"qwen",chatModel:c.chatModel||"",embedProvider:c.embedProvider||"qwen",embedModel:c.embedModel||"",threshold:Number.isFinite(Number(c.threshold))?Number(c.threshold):60,icpText:c.icpText||"",offerText:c.offerText||""};}
-async function feedSecret(kind){const s=(await chrome.storage.local.get("feedSecrets")).feedSecrets||{};return decryptSecret(s[kind]);}
+async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {chatProvider:c.chatProvider||"qwen",chatModel:c.chatModel||"",embedProvider:c.embedProvider||"qwen",embedModel:c.embedModel||"",region:c.region||"intl",threshold:Number.isFinite(Number(c.threshold))?Number(c.threshold):60,icpText:c.icpText||"",offerText:c.offerText||""};}
+// Passphrase vault: the derived AES key lives only in chrome.storage.session (memory,
+// cleared when the browser closes), so it survives SW restarts but locks each session.
+async function vaultSessionRaw(){return (await chrome.storage.session.get("feedSessionKey")).feedSessionKey||"";}
+async function vaultUnlockedKey(){const raw=await vaultSessionRaw();return raw?importKeyRaw(raw):null;}
+async function vaultGet(kind){const key=await vaultUnlockedKey();if(!key)return null;const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};if(!vault[kind])return "";try{return await decryptWithKey(key,vault[kind]);}catch{return "";}}
 function feedString(value){return typeof value==="string"?value:(value==null?"":JSON.stringify(value));}
 async function captureProfileForFeed(tabId, profileUrl){
   const data = await captureProfileSurface(tabId, profileUrl);
@@ -306,7 +310,7 @@ async function analyzeFeedProfile(url, ctx){
   if(cname){if(ctx.cache.has(cname)){cacheStatus="HIT";if(!facts.company.size)facts.company.size=ctx.cache.get(cname);}else if(facts.company.size){ctx.cache.set(cname,facts.company.size);}}
   // icp-scoring Phase 2/4 — embeddings cosine, ALL math in code
   let profileVec;
-  try{[profileVec]=await embed([profileEmbeddingText(facts)],{provider:ctx.cfg.embedProvider,apiKey:ctx.embedKey,model:ctx.cfg.embedModel});}
+  try{[profileVec]=await embed([profileEmbeddingText(facts)],{provider:ctx.cfg.embedProvider,apiKey:ctx.embedKey,model:ctx.cfg.embedModel,region:ctx.cfg.region});}
   catch(e){row.icp_score=`ICP_EMBED_ERROR: ${e.message}`;return {row};}
   const r=computeIcp(facts, profileVec, ctx.icp1Vec, ctx.icp2Vec);
   const report=buildIcpReport(facts, r, cacheStatus);
@@ -315,7 +319,7 @@ async function analyzeFeedProfile(url, ctx){
   // persona-framework + email-outreach — single combined Qwen call (max efficiency)
   const {system,user,max_tokens}=personaOutreachPrompt(ctx.cfg.icpText, ctx.cfg.offerText, facts, report);
   let text;
-  try{text=await chatLLM({provider:ctx.cfg.chatProvider,apiKey:ctx.qwenKey,model:ctx.cfg.chatModel,system,user,max_tokens});}
+  try{text=await chatLLM({provider:ctx.cfg.chatProvider,apiKey:ctx.qwenKey,model:ctx.cfg.chatModel,region:ctx.cfg.region,system,user,max_tokens});}
   catch(e){row.persona_card=`PERSONA_OUTREACH_ERROR: ${e.message}`;return {row};}
   const parsed=extractJson(text)||{};
   row.persona_card=feedString(parsed.persona_card);
@@ -337,20 +341,21 @@ async function finishFeed(state, stopReason){
 }
 async function runFeed({resume=false}={}){
   const cfg = await feedConfig();
-  const qwenKey = await feedSecret("qwen");
-  const embedKey = await feedSecret("embeddings");
+  const qwenKey = await vaultGet("qwen");
+  const embedKey = await vaultGet("embeddings");
   const state = await stored();
   let results = resume ? (state.feedResults||[]) : [];
   let index = resume ? Number(state.feedIndex||0) : 0;
   const urls = state.feedUrls || [];
   if(!Array.isArray(urls) || !urls.length){await save({running:false, stage:"FAILED", message:"No LinkedIn profile URLs were found in the file."}); return;}
+  if(qwenKey===null || embedKey===null){await save({running:true, paused:true, stage:"BLOCKED", message:"Key vault is locked — unlock it with your passphrase, then press Resume."}); return;}
   if(!qwenKey){await save({running:false, stage:"FAILED", message:"Set & verify the Qwen API key before running Feed."}); return;}
   if(!embedKey){await save({running:false, stage:"FAILED", message:"Set & verify the Embeddings API key before running Feed."}); return;}
   await save({mode:"feed", running:true, paused:false, cancelled:false, feedUrls:urls, feedIndex:index, feedResults:results,
     feedThreshold:cfg.threshold, total:urls.length, done:results.length, stage:"PROCESSING",
     message: resume?"Resuming Feed analysis…":"Embedding the two ICP vectors…"});
   let icp1Vec, icp2Vec;
-  try{[icp1Vec, icp2Vec] = await embed([ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT], {provider:cfg.embedProvider, apiKey:embedKey, model:cfg.embedModel});}
+  try{[icp1Vec, icp2Vec] = await embed([ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT], {provider:cfg.embedProvider, apiKey:embedKey, model:cfg.embedModel, region:cfg.region});}
   catch(e){await save({running:false, stage:"FAILED", message:`Embeddings call failed: ${e.message}`}); return;}
   if(!Array.isArray(icp1Vec)||!Array.isArray(icp2Vec)){await save({running:false, stage:"FAILED", message:"Embeddings provider returned no vectors for the ICPs."}); return;}
   const ctx = {qwenKey, embedKey, cfg, icp1Vec, icp2Vec, cache:feedHeadcountCache};
@@ -383,26 +388,64 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
   if (message.type === "RESUME_OPERATION") { await save({paused: false, message: "Resuming from the last durable checkpoint…"});await resumeDurableOperation();return {ok: true}; }
   if (message.type === "CANCEL_OPERATION") { const state=await save({cancelled:true,running:false,paused:false,stage:"CANCELLED",message:"Cancelled. Any active contact is returning to the queue."});if(state.mode==="enrichment"){await releaseLease(state.currentJob,state.run_id);await closeWorkerTab();await finishRun(state.run_id,"cancelled","cancelled",{done:Number(state.done||0),failed:Number(state.failed||0)})}else if(state.mode==="feed"){await closeWorkerTab()}return {ok: true}; }
   if(message.type==="OPEN_CRM"){await chrome.tabs.create({url:message.url});return{ok:true}}
+  if(message.type==="GET_FEED_KEY_STATUS"){
+    const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
+    const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
+    const cfg=await feedConfig();
+    return{ok:true,meta,hasPassphrase:Boolean(vault.kdf&&vault.verifier),unlocked:Boolean(await vaultSessionRaw()),cfg:{chatProvider:cfg.chatProvider,chatModel:cfg.chatModel,embedProvider:cfg.embedProvider,embedModel:cfg.embedModel,region:cfg.region}};
+  }
+  if(message.type==="SET_PASSPHRASE"){
+    const pass=String(message.passphrase||""); if(pass.length<6)return{ok:false,error:"Passphrase must be at least 6 characters."};
+    const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
+    if(vault.kdf)return{ok:false,error:"A passphrase already exists. Unlock, then use Change passphrase."};
+    const {key,saltB64}=await deriveVaultKey(pass);
+    await chrome.storage.local.set({feedVault:{kdf:{salt:saltB64,iterations:KDF_ITERATIONS},verifier:await makeVerifier(key)}});
+    await chrome.storage.session.set({feedSessionKey:await exportKeyRaw(key)});
+    return{ok:true};
+  }
+  if(message.type==="UNLOCK_VAULT"){
+    const pass=String(message.passphrase||""); if(!pass)return{ok:false,error:"Enter your passphrase."};
+    const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
+    if(!vault.kdf||!vault.verifier)return{ok:false,error:"No passphrase set yet.",needsSetup:true};
+    const {key}=await deriveVaultKey(pass,vault.kdf.salt);
+    if(!await checkVerifier(key,vault.verifier))return{ok:false,error:"Incorrect passphrase."};
+    await chrome.storage.session.set({feedSessionKey:await exportKeyRaw(key)});
+    return{ok:true};
+  }
+  if(message.type==="CHANGE_PASSPHRASE"){
+    const pass=String(message.passphrase||""); if(pass.length<6)return{ok:false,error:"New passphrase must be at least 6 characters."};
+    const oldKey=await vaultUnlockedKey(); if(!oldKey)return{ok:false,error:"Unlock with the current passphrase first."};
+    const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
+    const {key,saltB64}=await deriveVaultKey(pass);
+    const next={kdf:{salt:saltB64,iterations:KDF_ITERATIONS},verifier:await makeVerifier(key)};
+    for(const kind of ["qwen","embeddings"]){if(vault[kind]){try{next[kind]=await encryptWithKey(key,await decryptWithKey(oldKey,vault[kind]));}catch{}}}
+    await chrome.storage.local.set({feedVault:next});
+    await chrome.storage.session.set({feedSessionKey:await exportKeyRaw(key)});
+    return{ok:true};
+  }
+  if(message.type==="LOCK_VAULT"){await chrome.storage.session.remove("feedSessionKey");return{ok:true};}
   if(message.type==="SET_FEED_KEY"){
     const kind=message.kind; if(!["qwen","embeddings"].includes(kind))return{ok:false,error:"Unknown key."};
     const value=String(message.value||"").trim(); if(!value)return{ok:false,error:"Enter a key value."};
-    const secrets=(await chrome.storage.local.get("feedSecrets")).feedSecrets||{};
-    secrets[kind]=await encryptSecret(value);
+    const sessKey=await vaultUnlockedKey(); if(!sessKey)return{ok:false,error:"Unlock the vault with your passphrase first."};
+    const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
+    vault[kind]=await encryptWithKey(sessKey,value);
     const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
+    if(message.region)cfg.region=message.region;
     if(kind==="qwen"){cfg.chatProvider=message.provider||cfg.chatProvider||"qwen";cfg.chatModel=String(message.model||cfg.chatModel||"").trim();}
     else{cfg.embedProvider=message.provider||cfg.embedProvider||"qwen";cfg.embedModel=String(message.model||cfg.embedModel||"").trim();}
-    await chrome.storage.local.set({feedSecrets:secrets,feedConfig:cfg});
+    await chrome.storage.local.set({feedVault:vault,feedConfig:cfg});
+    const region=cfg.region||"intl";
     let verified=false,error="";
     try{
-      if(kind==="qwen"){await chatLLM({provider:cfg.chatProvider,apiKey:value,model:cfg.chatModel,system:"You are a connection test.",user:"Reply with OK.",max_tokens:5});verified=true;}
-      else{const v=await embed(["connection test"],{provider:cfg.embedProvider,apiKey:value,model:cfg.embedModel});verified=Array.isArray(v)&&Array.isArray(v[0])&&v[0].length>0;if(!verified)error="Provider returned no embedding vector.";}
+      if(kind==="qwen"){await chatLLM({provider:cfg.chatProvider,apiKey:value,model:cfg.chatModel,region,system:"You are a connection test.",user:"Reply with OK.",max_tokens:5});verified=true;}
+      else{const v=await embed(["connection test"],{provider:cfg.embedProvider,apiKey:value,model:cfg.embedModel,region});verified=Array.isArray(v)&&Array.isArray(v[0])&&v[0].length>0;if(!verified)error="Provider returned no embedding vector.";}
     }catch(e){error=e.message;}
     const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
     meta[kind]={set:true,verified}; await chrome.storage.local.set({feedKeyMeta:meta});
     return{ok:true,verified,error};
   }
-  if(message.type==="GET_FEED_KEY_STATUS"){const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};const cfg=await feedConfig();return{ok:true,meta,cfg:{chatProvider:cfg.chatProvider,chatModel:cfg.chatModel,embedProvider:cfg.embedProvider,embedModel:cfg.embedModel}};}
-  if(message.type==="CLEAR_FEED_KEY"){const kind=message.kind;const s=(await chrome.storage.local.get("feedSecrets")).feedSecrets||{};const m=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};delete s[kind];delete m[kind];await chrome.storage.local.set({feedSecrets:s,feedKeyMeta:m});return{ok:true};}
+  if(message.type==="CLEAR_FEED_KEY"){const kind=message.kind;const v=(await chrome.storage.local.get("feedVault")).feedVault||{};const m=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};delete v[kind];delete m[kind];await chrome.storage.local.set({feedVault:v,feedKeyMeta:m});return{ok:true};}
   if(message.type==="START_FEED"){
     const state=await stored(); if(state.running)return{ok:false,error:"An operation is already running."};
     const urls=parseProfileLinks(message.linksText||"");
@@ -410,9 +453,10 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
     if(!meta.qwen?.set)return{ok:false,error:"Set the Qwen API key first."};
     if(!meta.embeddings?.set)return{ok:false,error:"Set the Embeddings API key first."};
+    if(!(await vaultSessionRaw()))return{ok:false,error:"Unlock the key vault with your passphrase first."};
     const threshold=Math.max(0,Math.min(100,Number(message.threshold)||60));
     const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
-    await chrome.storage.local.set({feedConfig:{...cfg,chatProvider:message.chatProvider||cfg.chatProvider||"qwen",chatModel:String(message.chatModel||cfg.chatModel||"").trim(),embedProvider:message.embedProvider||cfg.embedProvider||"qwen",embedModel:String(message.embedModel||cfg.embedModel||"").trim(),threshold,icpText:String(message.icpText||""),offerText:String(message.offerText||"")}});
+    await chrome.storage.local.set({feedConfig:{...cfg,chatProvider:message.chatProvider||cfg.chatProvider||"qwen",chatModel:String(message.chatModel||cfg.chatModel||"").trim(),embedProvider:message.embedProvider||cfg.embedProvider||"qwen",embedModel:String(message.embedModel||cfg.embedModel||"").trim(),region:message.region||cfg.region||"intl",threshold,icpText:String(message.icpText||""),offerText:String(message.offerText||"")}});
     await chrome.storage.local.remove("feedCsv");
     feedHeadcountCache.clear();
     await save({mode:"feed",feedUrls:urls.slice(0,FEED_MAX),feedIndex:0,feedResults:[],feedThreshold:threshold,total:urls.length,done:0,running:false,paused:false,cancelled:false,stage:"QUEUED",message:`Queued ${urls.length} profile(s) for Feed analysis`});

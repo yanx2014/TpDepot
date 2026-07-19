@@ -27,14 +27,24 @@ The token is verified before use and is hidden after connection. Collection uses
 
 The **Feed** tab runs an end-to-end analysis of a list of LinkedIn profiles and exports a CSV. It runs entirely in your browser and implements the three recruitment-niche skills (`.claude/skills/icp-scoring`, `persona-framework`, `email-outreach`).
 
-### Keys (encrypted, write-only)
+### Passphrase-gated key vault
+
+Keys are protected by a **passphrase you enter once per browser session** — the passphrase is never stored.
+
+- Set a passphrase (**Create**) the first time. It derives an AES-256 key via **PBKDF2** (210k iterations, SHA-256) that encrypts your API keys (AES-GCM) at rest.
+- Each browser session, **Unlock** with the passphrase. The derived key lives only in memory (`chrome.storage.session`), so it survives service-worker restarts but clears when the browser closes — you re-unlock next session. **Lock** clears it immediately; **Change** re-encrypts the stored keys under a new passphrase (while unlocked).
+- Without the passphrase the stored keys are unreadable — this is real per-secret protection, not obfuscation.
+
+### Keys
 
 - **Qwen API key** — reasoning (persona + outreach). Provider defaults to Qwen/DashScope (`qwen-plus`); OpenAI selectable.
 - **Embeddings API key** — ICP semantic scoring. Provider defaults to Qwen `text-embedding-v3`; OpenAI `text-embedding-3-small` selectable.
 
-Both keys are **AES-GCM encrypted at rest** and never returned to the UI. Press **Save & verify** and the extension stores the key encrypted, runs a live connection test, and shows 🔒 *Configured & connection verified*. Once set, the field shows only `••••••••`; re-enter a value to replace it, or **Clear** to remove it. (The encryption is obfuscation-grade — it keeps keys out of plaintext storage, but is not an OS keychain.)
+You must unlock the vault before setting a key. Press **Save & verify** and the extension encrypts the key, runs a **live connection test**, and shows 🔒 *Configured & connection verified*. Once set the field shows only `••••••••` (write-only); re-enter to replace, or **Clear** to remove.
 
-> DashScope defaults to the **international** endpoint (`dashscope-intl.aliyuncs.com`). If your key is China-region, that verification will fail — tell us and we'll switch the base URL.
+### DashScope region toggle
+
+**International (`dashscope-intl.aliyuncs.com`)** by default, or **China (`dashscope.aliyuncs.com`)** — the toggle switches the base host for all Qwen chat + embeddings calls. If a key verification fails with an auth error, try the other region.
 
 ### Inputs
 

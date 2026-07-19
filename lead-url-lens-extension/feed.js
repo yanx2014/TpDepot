@@ -262,14 +262,12 @@ Return ONLY a JSON object, no markdown fences:
 }
 
 /* --------------------------------------------------------------- LLM + embeddings */
-const CHAT = {
-  qwen: { url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", model: "qwen-plus" },
-  openai: { url: "https://api.openai.com/v1/chat/completions", model: "gpt-4o-mini" },
-};
-const EMBED = {
-  qwen: { url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings", model: "text-embedding-v3" },
-  openai: { url: "https://api.openai.com/v1/embeddings", model: "text-embedding-3-small" },
-};
+// DashScope has two regions; the toggle selects the base host for Qwen calls.
+const DASHSCOPE = { intl: "https://dashscope-intl.aliyuncs.com", cn: "https://dashscope.aliyuncs.com" };
+const QWEN_CHAT_MODEL = "qwen-plus", QWEN_EMBED_MODEL = "text-embedding-v3";
+const OPENAI_CHAT = { url: "https://api.openai.com/v1/chat/completions", model: "gpt-4o-mini" };
+const OPENAI_EMBED = { url: "https://api.openai.com/v1/embeddings", model: "text-embedding-3-small" };
+const qwenBase = region => DASHSCOPE[region] || DASHSCOPE.intl;
 
 async function timedFetch(url, options, ms = 120000) {
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), ms);
@@ -278,8 +276,8 @@ async function timedFetch(url, options, ms = 120000) {
   finally { clearTimeout(timer); }
 }
 
-// Chat completion. providers: "qwen" (default), "openai", "anthropic".
-export async function chatLLM({ provider = "qwen", apiKey, model, system, user, max_tokens = 1024 }) {
+// Chat completion. providers: "qwen" (default), "openai", "anthropic". region applies to qwen.
+export async function chatLLM({ provider = "qwen", apiKey, model, region = "intl", system, user, max_tokens = 1024 }) {
   if (!apiKey) throw new Error("LLM API key is required.");
   if (provider === "anthropic") {
     const r = await timedFetch("https://api.anthropic.com/v1/messages", {
@@ -291,30 +289,31 @@ export async function chatLLM({ provider = "qwen", apiKey, model, system, user, 
     if (!r.ok) throw new Error(p?.error?.message || `Anthropic error ${r.status}`);
     return (p?.content || []).filter(b => b.type === "text").map(b => b.text).join("").trim();
   }
-  const cfg = CHAT[provider] || CHAT.qwen;
-  const r = await timedFetch(cfg.url, {
+  const url = provider === "openai" ? OPENAI_CHAT.url : `${qwenBase(region)}/compatible-mode/v1/chat/completions`;
+  const defModel = provider === "openai" ? OPENAI_CHAT.model : QWEN_CHAT_MODEL;
+  const r = await timedFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: model || cfg.model, max_tokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+    body: JSON.stringify({ model: model || defModel, max_tokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
   });
   const p = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(p?.error?.message || p?.message || `${provider} error ${r.status}`);
   return (p?.choices?.[0]?.message?.content || "").trim();
 }
 
-// Embeddings. providers: "qwen" (text-embedding-v3), "openai" (text-embedding-3-small).
-export async function embed(texts, { provider = "qwen", apiKey, model } = {}) {
+// Embeddings. providers: "qwen" (text-embedding-v3), "openai" (text-embedding-3-small). region applies to qwen.
+export async function embed(texts, { provider = "qwen", apiKey, model, region = "intl" } = {}) {
   if (!apiKey) throw new Error("Embeddings API key is required.");
-  const cfg = EMBED[provider] || EMBED.qwen;
-  const r = await timedFetch(cfg.url, {
+  const url = provider === "openai" ? OPENAI_EMBED.url : `${qwenBase(region)}/compatible-mode/v1/embeddings`;
+  const defModel = provider === "openai" ? OPENAI_EMBED.model : QWEN_EMBED_MODEL;
+  const r = await timedFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: model || cfg.model, input: texts }),
+    body: JSON.stringify({ model: model || defModel, input: texts }),
   }, 60000);
   const p = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(p?.error?.message || p?.message || `embeddings error ${r.status}`);
-  const data = p?.data || [];
-  return data.map(d => d.embedding);
+  return (p?.data || []).map(d => d.embedding);
 }
 
 export function extractJson(text) {
@@ -341,29 +340,38 @@ export function buildFeedCsv(rows) {
 }
 export function csvDataUrl(csv) { return "data:text/csv;charset=utf-8," + encodeURIComponent(csv); }
 
-/* ------------------------------------------------ secret encryption (AES-GCM) */
-async function getWrapKey() {
-  const store = await chrome.storage.local.get("__lulWrap");
-  let raw = store.__lulWrap;
-  if (!raw) {
-    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
-    const exported = new Uint8Array(await crypto.subtle.exportKey("raw", key));
-    raw = btoa(String.fromCharCode(...exported));
-    await chrome.storage.local.set({ __lulWrap: raw });
-  }
-  const bytes = Uint8Array.from(atob(raw), c => c.charCodeAt(0));
-  return crypto.subtle.importKey("raw", bytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+/* ---------------------------- passphrase-gated key vault (PBKDF2 + AES-GCM) */
+// Keys are encrypted with a key derived from a user passphrase that is NEVER
+// stored. The derived AES key is held only in memory (chrome.storage.session)
+// for the browser session, so keys survive service-worker restarts but require
+// re-unlocking after the browser closes.
+export const KDF_ITERATIONS = 210000;
+const VERIFIER_TEXT = "lead-url-lens-vault-verifier";
+const b64 = bytes => btoa(String.fromCharCode(...bytes));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+async function deriveAesKey(passphrase, salt) {
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: KDF_ITERATIONS, hash: "SHA-256" }, base,
+    { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
 }
-export async function encryptSecret(plain) {
-  const key = await getWrapKey();
+// Derive a vault key from a passphrase. Pass saltB64 to reuse an existing salt.
+export async function deriveVaultKey(passphrase, saltB64) {
+  const salt = saltB64 ? unb64(saltB64) : crypto.getRandomValues(new Uint8Array(16));
+  return { key: await deriveAesKey(passphrase, salt), saltB64: b64(salt) };
+}
+export async function exportKeyRaw(key) { return b64(new Uint8Array(await crypto.subtle.exportKey("raw", key))); }
+export async function importKeyRaw(raw) { return crypto.subtle.importKey("raw", unb64(raw), { name: "AES-GCM" }, true, ["encrypt", "decrypt"]); }
+export async function encryptWithKey(key, plain) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(String(plain))));
-  return { iv: btoa(String.fromCharCode(...iv)), ct: btoa(String.fromCharCode(...ct)) };
+  return { iv: b64(iv), ct: b64(ct) };
 }
-export async function decryptSecret(obj) {
+export async function decryptWithKey(key, obj) {
   if (!obj || !obj.iv || !obj.ct) return "";
-  const key = await getWrapKey();
-  const iv = Uint8Array.from(atob(obj.iv), c => c.charCodeAt(0));
-  const ct = Uint8Array.from(atob(obj.ct), c => c.charCodeAt(0));
-  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct));
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(obj.iv) }, key, unb64(obj.ct)));
+}
+export async function makeVerifier(key) { return encryptWithKey(key, VERIFIER_TEXT); }
+export async function checkVerifier(key, verifier) {
+  try { return (await decryptWithKey(key, verifier)) === VERIFIER_TEXT; } catch { return false; }
 }
