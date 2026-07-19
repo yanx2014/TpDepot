@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "TechNFirms Lead URL Lens",
+  "version": "14.0.0",
+  "description": "Capture LinkedIn search results, run durable one-contact-leased enrichment, and run the Feed workflow: score a list of profiles against an ICP and draft persona cards and outreach, exported as CSV.",
+  "permissions": ["activeTab", "tabs", "storage", "scripting", "downloads", "alarms"],
+  "host_permissions": [
+    "https://www.linkedin.com/*",
+    "https://lead-url-lens-crm.yann-brou222.chatgpt.site/*",
+    "https://api.anthropic.com/*",
+    "https://api.openai.com/*",
+    "https://raw.githubusercontent.com/*",
+    "https://gist.githubusercontent.com/*"
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {"service_worker": "service-worker.js", "type": "module"},
+  "action": {
+    "default_title": "TechNFirms Lead URL Lens",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.linkedin.com/*", "https://lead-url-lens-crm.yann-brou222.chatgpt.site/*"],
+      "js": ["experience-contract.js", "content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.linkedin.com/search/results/people/*", "https://www.linkedin.com/sales/search/people*"],
+      "js": ["search-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.linkedin.com/*"],
+      "js": ["panel.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [{"resources": ["icons/*.png"], "matches": ["https://www.linkedin.com/*"]}]
+}
