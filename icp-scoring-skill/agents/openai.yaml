@@ -1,0 +1,12 @@
+interface:
+  display_name: ICP Scoring
+  short_description: Score LinkedIn results against any ICP
+  default_prompt: Use $icp-scoring to rank these LinkedIn search results against my
+    ICP and export a semicolon-delimited CSV.
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "TechNFirms Lead URL Lens",
-  "version": "16.0.0",
-  "description": "Capture LinkedIn search results, run durable one-contact-leased enrichment, and run the Feed workflow: embeddings-based ICP scoring plus Qwen-drafted persona cards and French outreach, exported as CSV.",
+  "version": "17.0.0",
+  "description": "Capture LinkedIn search results, run durable one-contact-leased enrichment, and run the Feed workflow: generalized ICP scoring (OpenAI embeddings + deterministic rules) exported as a semicolon CSV.",
   "permissions": ["activeTab", "tabs", "storage", "scripting", "downloads", "alarms"],
   "host_permissions": [
     "https://www.linkedin.com/*",

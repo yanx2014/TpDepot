@@ -1,6 +1,6 @@
 /* TechNFirms Lead URL Lens — user initiated, durable, inactive-tab, checkpoint safe. */
-import {parseProfileLinks, factsForProfile, profileEmbeddingText, computeIcp, verdictBand, buildIcpReport, personaOutreachPrompt, chatLLM, embed, extractJson, buildFeedCsv, csvDataUrl, deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier, checkVerifier, KDF_ITERATIONS, ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT} from "./feed.js";
-const feedHeadcountCache = new Map();
+import {parseProfileLinks, canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeCriteria, normalizedWeights, icpEmbedTexts, scoreProfile, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, buildScoreCsv, csvDataUrl, chatLLM, embed, extractJson, sha256Hex, deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier, checkVerifier, KDF_ITERATIONS} from "./feed.js";
+const feedEmbedCache = new Map();
 const MAX_TARGET = 500;
 const FEED_MAX = 1000;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -278,13 +278,12 @@ async function enrichQueue({importId, limit, resume = false, maxSteps = Infinity
 }
 
 /* ----------------------------------------------------------------- Feed workflow */
-async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {chatProvider:c.chatProvider||"qwen",chatModel:c.chatModel||"",embedProvider:c.embedProvider||"qwen",embedModel:c.embedModel||"",region:c.region||"intl",threshold:Number.isFinite(Number(c.threshold))?Number(c.threshold):60,icpText:c.icpText||"",offerText:c.offerText||""};}
+async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {qwenModel:c.qwenModel||"qwen3.7-plus", region:c.region||"intl", icpText:c.icpText||""};}
 // Passphrase vault: the derived AES key lives only in chrome.storage.session (memory,
 // cleared when the browser closes), so it survives SW restarts but locks each session.
 async function vaultSessionRaw(){return (await chrome.storage.session.get("feedSessionKey")).feedSessionKey||"";}
 async function vaultUnlockedKey(){const raw=await vaultSessionRaw();return raw?importKeyRaw(raw):null;}
 async function vaultGet(kind){const key=await vaultUnlockedKey();if(!key)return null;const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};if(!vault[kind])return "";try{return await decryptWithKey(key,vault[kind]);}catch{return "";}}
-function feedString(value){return typeof value==="string"?value:(value==null?"":JSON.stringify(value));}
 // Feed capture: uses the graceful CAPTURE_PROFILE_LITE (top-card facts + best-effort
 // experience, no hard-fail on a missing Experience section). Attempt 1 runs in the
 // background tab; retries briefly activate the tab so LinkedIn's lazy-loaded
@@ -304,96 +303,113 @@ async function captureProfileLiteSurface(tabId, profileUrl){
   if(prev?.id&&prev.id!==tabId)try{await chrome.tabs.update(prev.id,{active:true});}catch{}
   return last;
 }
-async function captureProfileForFeed(tabId, profileUrl){
-  const data = await captureProfileLiteSurface(tabId, profileUrl);
-  if(data?.blocked && data.error_code==="linkedin_checkpoint") return {checkpoint:true};
-  if(data?.blocked){
-    return {ok:false, error_code:data?.error_code||"profile_capture_failed", error_message:data?.error_message||""};
-  }
-  // Best-effort recent activity + company facts — strengthens outreach, never blocks the row.
-  try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/posts/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const posts=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"post",limit:5}).catch(()=>[]);data.posts=Array.isArray(posts)?posts.slice(0,5):[];}catch{data.posts=[];}
-  try{await chrome.tabs.update(tabId,{url:profileUrl.replace(/\/$/,"")+"/recent-activity/comments/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const comments=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_ACTIVITY",activity_type:"comment",limit:7}).catch(()=>[]);data.comments=Array.isArray(comments)?comments.slice(0,7):[];}catch{data.comments=[];}
-  if(data.company_profile_url){try{await chrome.tabs.update(tabId,{url:data.company_profile_url.replace(/\/$/,"")+"/about/",active:false});await waitLoaded(tabId);await ensureProfileReceiver(tabId);const company=await chrome.tabs.sendMessage(tabId,{type:"CAPTURE_COMPANY"}).catch(()=>null);if(company&&!company.blocked)data.company_page=company;}catch{}}
-  return {ok:true, data};
+// Compile the user's ICP (prose/JSON) into the scoring schema. Structured JSON is
+// used directly; prose is compiled by one cached Qwen call (keyed on the ICP hash).
+async function compileIcp(icpText, cfg, qwenKey){
+  const direct = extractJson(icpText);
+  if(direct && (direct.icp?.criteria || direct.criteria)) return direct.icp ? direct : {icp:direct};
+  const hash = await sha256Hex(icpText);
+  const cached = (await chrome.storage.local.get("feedIcpCompiled")).feedIcpCompiled;
+  if(cached && cached.hash===hash && cached.icp?.icp?.criteria) return cached.icp;
+  if(!qwenKey) throw new Error("Set the Qwen key to compile the ICP prose, or paste a structured ICP JSON.");
+  const {system,user,max_tokens,temperature,json}=compileIcpPrompt(icpText);
+  const text=await chatLLM({provider:"qwen",apiKey:qwenKey,model:cfg.qwenModel,region:cfg.region,system,user,max_tokens,temperature,json});
+  const parsed=extractJson(text);
+  const icp = parsed?.icp?.criteria ? parsed : (parsed?.criteria ? {icp:parsed} : null);
+  if(!icp || !icp.icp?.criteria) throw new Error("Could not compile the ICP into the scoring schema.");
+  await chrome.storage.local.set({feedIcpCompiled:{hash,icp}});
+  return icp;
 }
-async function analyzeFeedProfile(url, ctx){
+// Location score: deterministic exact/containment first; unresolved → one cached Qwen call.
+async function resolveLocationScore(location, ctx){
+  const exact = exactLocationScore(location, ctx.acceptedLocations);
+  if(exact!==null) return exact;
+  if(!ctx.qwenKey) return 0.0;
+  const cacheKey=`${ctx.acceptedHash}|${fold(location)}`;
+  const cache=(await chrome.storage.local.get("feedLocCache")).feedLocCache||{};
+  if(cacheKey in cache) return cache[cacheKey];
+  let score=0.0;
+  try{
+    const {system,user,max_tokens,temperature,json}=locationNormalizePrompt([location], ctx.acceptedLocations);
+    const text=await chatLLM({provider:"qwen",apiKey:ctx.qwenKey,model:ctx.cfg.qwenModel,region:ctx.cfg.region,system,user,max_tokens,temperature,json});
+    const parsed=extractJson(text)||{};
+    const item=(parsed.results||[]).find(r=>normText(r.input)===normText(location))||(parsed.results||[])[0];
+    if(item){const s=Number(item.score),conf=Number(item.confidence);if([0,0.5,1].includes(s)&&conf>=0.75)score=s;}
+  }catch{}
+  cache[cacheKey]=score; await chrome.storage.local.set({feedLocCache:cache});
+  return score;
+}
+// Score one LinkedIn result: capture → extract fields → embed (OpenAI) → deterministic score.
+async function scoreOneProfile(url, ctx){
   const worker = await acquireLinkedInWorkerTab(url);
-  const captured = await captureProfileForFeed(worker.tab.id, url);
-  if(captured.checkpoint) return {checkpoint:true};
-  const row = {url, icp_score:"", icp_total:null, persona_card:"", opportunity_score:"", outreach_1:"", outreach_2:"", outreach_3:"", raw:{}};
-  if(!captured.ok){row.icp_score=`CAPTURE_FAILED: ${captured.error_code||"unknown"} ${captured.error_message||""}`.trim();return {row};}
-  const facts = factsForProfile(captured.data);
-  // icp-scoring Phase 1 — company headcount cache
-  let cacheStatus="MISS & UPDATED";
-  const cname=(facts.current_company||"").trim().toLowerCase();
-  if(cname){if(ctx.cache.has(cname)){cacheStatus="HIT";if(!facts.company.size)facts.company.size=ctx.cache.get(cname);}else if(facts.company.size){ctx.cache.set(cname,facts.company.size);}}
-  // icp-scoring Phase 2/4 — embeddings cosine, ALL math in code
-  let profileVec;
-  try{[profileVec]=await embed([profileEmbeddingText(facts)],{provider:ctx.cfg.embedProvider,apiKey:ctx.embedKey,model:ctx.cfg.embedModel,region:ctx.cfg.region});}
-  catch(e){row.icp_score=`ICP_EMBED_ERROR: ${e.message}`;return {row};}
-  const r=computeIcp(facts, profileVec, ctx.icp1Vec, ctx.icp2Vec);
-  const report=buildIcpReport(facts, r, cacheStatus);
-  row.icp_score=report; row.icp_total=r.total; row.raw.icp={total:r.total,verdict:verdictBand(r.total),s1:r.s1,s2:r.s2};
-  if(r.total < ctx.cfg.threshold){row.persona_card=`Below threshold (${r.total} < ${ctx.cfg.threshold}) — persona & outreach not generated.`;return {row};}
-  // persona-framework + email-outreach — single combined Qwen call (max efficiency)
-  const {system,user,max_tokens}=personaOutreachPrompt(ctx.cfg.icpText, ctx.cfg.offerText, facts, report);
-  let text;
-  try{text=await chatLLM({provider:ctx.cfg.chatProvider,apiKey:ctx.qwenKey,model:ctx.cfg.chatModel,region:ctx.cfg.region,system,user,max_tokens});}
-  catch(e){row.persona_card=`PERSONA_OUTREACH_ERROR: ${e.message}`;return {row};}
-  const parsed=extractJson(text)||{};
-  row.persona_card=feedString(parsed.persona_card);
-  row.opportunity_score=Number.isFinite(Number(parsed.opportunity_score))?Math.round(Number(parsed.opportunity_score)):"";
-  row.outreach_1=feedString(parsed.outreach_1); row.outreach_2=feedString(parsed.outreach_2); row.outreach_3=feedString(parsed.outreach_3);
-  row.raw.persona_outreach=text;
+  const data = await captureProfileLiteSurface(worker.tab.id, url);
+  if(data?.blocked && data.error_code==="linkedin_checkpoint") return {checkpoint:true};
+  const rf = rowFieldsFromCapture(data?.blocked ? {profile_url:url} : data);
+  const row = {full_name:rf.full_name, job_section:rf.job_section, headline:rf.headline, location:rf.location, linkedin_url:rf.linkedin_url||url, icp_score:"NOT COMPUTED"};
+  if(data?.blocked){row._note=data.error_code||"capture_failed"; return {row};}
+  const payload = normText(`${rf.job_section} ${rf.headline}`) || "[missing profile text]";
+  const vectors = {...ctx.icpVectors};
+  try{
+    if(!ctx.embedCache.has(payload)){const [v]=await embed([payload],{apiKey:ctx.openaiKey}); if(v)ctx.embedCache.set(payload,v);}
+    if(ctx.embedCache.has(payload)) vectors[payload]=ctx.embedCache.get(payload);
+  }catch(e){row._note=`embed_error: ${e.message}`; return {row};}
+  const locScore = ctx.active.locations ? await resolveLocationScore(rf.location, ctx) : 0;
+  row.icp_score = scoreProfile(rf, ctx.active, ctx.weights, vectors, locScore);
   return {row};
 }
 async function finishFeed(state, stopReason){
   const results = state.feedResults || [];
   let downloadOk=false, downloadError="";
-  try{const csv=buildFeedCsv(results);await chrome.storage.local.set({feedCsv:csv});await chrome.downloads.download({url:csvDataUrl(csv), filename:"lead-url-lens-feed.csv", saveAs:false});downloadOk=true;}
+  try{const csv=buildScoreCsv(results);await chrome.storage.local.set({feedCsv:csv});await chrome.downloads.download({url:csvDataUrl(csv), filename:"icp-scores.csv", saveAs:false});downloadOk=true;}
   catch(error){downloadError=error?.message||"download_failed";}
   await closeWorkerTab();
-  const qualified = results.filter(r=>Number.isFinite(Number(r.opportunity_score))).length;
+  const scored = results.filter(r=>Number.isFinite(Number(r.icp_score))).length, notComputed = results.length-scored;
   await save({running:false, stage:downloadOk?"DONE":"FAILED", stop_reason:stopReason,
-    message: downloadOk ? `Feed complete · ${results.length} rows · ${qualified} qualified (≥${state.feedThreshold}) · CSV downloaded`
+    message: downloadOk ? `Feed complete · ${results.length} rows · ${scored} scored · ${notComputed} not computed · CSV downloaded`
       : `Feed finished but CSV export failed: ${downloadError}. Use Download CSV to retry.`});
 }
 async function runFeed({resume=false}={}){
   const cfg = await feedConfig();
   const qwenKey = await vaultGet("qwen");
-  const embedKey = await vaultGet("embeddings");
+  const openaiKey = await vaultGet("embeddings");
   const state = await stored();
   let results = resume ? (state.feedResults||[]) : [];
   let index = resume ? Number(state.feedIndex||0) : 0;
   const urls = state.feedUrls || [];
   if(!Array.isArray(urls) || !urls.length){await save({running:false, stage:"FAILED", message:"No LinkedIn profile URLs were found in the file."}); return;}
-  if(qwenKey===null || embedKey===null){await save({running:true, paused:true, stage:"BLOCKED", message:"Key vault is locked — unlock it with your passphrase, then press Resume."}); return;}
-  if(!qwenKey){await save({running:false, stage:"FAILED", message:"Set & verify the Qwen API key before running Feed."}); return;}
-  if(!embedKey){await save({running:false, stage:"FAILED", message:"Set & verify the Embeddings API key before running Feed."}); return;}
+  if(qwenKey===null || openaiKey===null){await save({running:true, paused:true, stage:"BLOCKED", message:"Key vault is locked — unlock it with your passphrase, then press Resume."}); return;}
+  if(!openaiKey){await save({running:false, stage:"FAILED", message:"Set & verify the OpenAI key (embeddings) before running Feed."}); return;}
   await save({mode:"feed", running:true, paused:false, cancelled:false, feedUrls:urls, feedIndex:index, feedResults:results,
-    feedThreshold:cfg.threshold, total:urls.length, done:results.length, stage:"PROCESSING",
-    message: resume?"Resuming Feed analysis…":"Embedding the two ICP vectors…"});
-  let icp1Vec, icp2Vec;
-  try{[icp1Vec, icp2Vec] = await embed([ICP1_VECTOR_TEXT, ICP2_VECTOR_TEXT], {provider:cfg.embedProvider, apiKey:embedKey, model:cfg.embedModel, region:cfg.region});}
-  catch(e){await save({running:false, stage:"FAILED", message:`Embeddings call failed: ${e.message}`}); return;}
-  if(!Array.isArray(icp1Vec)||!Array.isArray(icp2Vec)){await save({running:false, stage:"FAILED", message:"Embeddings provider returned no vectors for the ICPs."}); return;}
-  const ctx = {qwenKey, embedKey, cfg, icp1Vec, icp2Vec, cache:feedHeadcountCache};
+    total:urls.length, done:results.length, stage:"COMPILING", message: resume?"Resuming ICP scoring…":"Compiling the ICP and embedding its criteria…"});
+  let active, weights, icpVectors, acceptedLocations, acceptedHash;
+  try{
+    const icp = await compileIcp(cfg.icpText, cfg, qwenKey);
+    active = activeCriteria(icp.icp);
+    weights = normalizedWeights(active);
+    if(!weights) throw new Error("The compiled ICP has no weighted criteria.");
+    const texts = icpEmbedTexts(active);
+    const vecs = texts.length ? await embed(texts, {apiKey:openaiKey}) : [];
+    icpVectors = {}; texts.forEach((t,i)=>{if(vecs[i])icpVectors[t]=vecs[i];});
+    acceptedLocations = (active.locations?.values||[]).map(normText);
+    acceptedHash = await sha256Hex(JSON.stringify(acceptedLocations));
+  }catch(e){await save({running:false, stage:"FAILED", message:`ICP setup failed: ${e.message}`}); return;}
+  const ctx = {cfg, qwenKey, openaiKey, active, weights, icpVectors, acceptedLocations, acceptedHash, embedCache:feedEmbedCache};
   let stopReason="batch_complete";
   try{
     while(index < urls.length){
       let s=await stored(); if(s.cancelled){stopReason="cancelled";break;}
       while(s.paused){await sleep(400);s=await stored();if(s.cancelled)break;} if(s.cancelled){stopReason="cancelled";break;}
       const url = urls[index];
-      await save({stage:"ANALYZE", message:`Analyzing ${index+1}/${urls.length}: ${url}`});
+      await save({stage:"SCORE", message:`Scoring ${index+1}/${urls.length}: ${url}`});
       let outcome;
-      try{outcome = await analyzeFeedProfile(url, ctx);}
-      catch(error){outcome = {row:{url, icp_score:`ERROR: ${error?.message||"analysis_failed"}`, icp_total:null, persona_card:"", opportunity_score:"", outreach_1:"", outreach_2:"", outreach_3:"", raw:{}}};}
+      try{outcome = await scoreOneProfile(url, ctx);}
+      catch(error){outcome = {row:{full_name:"", job_section:"", headline:"", location:"", linkedin_url:url, icp_score:"NOT COMPUTED", _note:error?.message||"error"}};}
       if(outcome.checkpoint){await save({paused:true, stage:"BLOCKED", message:"LinkedIn security checkpoint detected. Resolve it in the worker tab, then press Resume."}); return;}
       results = [...results, outcome.row]; index += 1;
-      await save({feedResults:results, feedIndex:index, done:results.length, message:`Analyzed ${index}/${urls.length}`});
+      await save({feedResults:results, feedIndex:index, done:results.length, message:`Scored ${index}/${urls.length}`});
     }
   }catch(error){await save({running:false, stage:"FAILED", message:`Feed failed: ${error?.message||error}`}); return;}
-  if(stopReason==="cancelled"){await closeWorkerTab();await save({running:false, stage:"CANCELLED", message:`Cancelled · ${results.length} analyzed. Use Download CSV for partial results.`}); return;}
+  if(stopReason==="cancelled"){await closeWorkerTab();await save({running:false, stage:"CANCELLED", message:`Cancelled · ${results.length} scored. Use Download CSV for partial results.`}); return;}
   await finishFeed(await stored(), stopReason);
 }
 async function resumeDurableOperation(){const state=await stored();if(!state.running||state.paused||wakeLock)return;wakeLock=true;try{if(state.mode==="capture")await captureSearch({target:state.target,listName:state.listName,importId:state.importId,resume:true});else if(state.mode==="enrichment")await enrichQueue({importId:state.importId,limit:state.target,resume:true,maxSteps:1});else if(state.mode==="feed")await runFeed({resume:true})}finally{wakeLock=false}}
@@ -411,7 +427,7 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
     const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
     const cfg=await feedConfig();
-    return{ok:true,meta,hasPassphrase:Boolean(vault.kdf&&vault.verifier),unlocked:Boolean(await vaultSessionRaw()),cfg:{chatProvider:cfg.chatProvider,chatModel:cfg.chatModel,embedProvider:cfg.embedProvider,embedModel:cfg.embedModel,region:cfg.region}};
+    return{ok:true,meta,hasPassphrase:Boolean(vault.kdf&&vault.verifier),unlocked:Boolean(await vaultSessionRaw()),cfg:{qwenModel:cfg.qwenModel,region:cfg.region}};
   }
   if(message.type==="SET_PASSPHRASE"){
     const pass=String(message.passphrase||""); if(pass.length<6)return{ok:false,error:"Passphrase must be at least 6 characters."};
@@ -450,15 +466,13 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
     vault[kind]=await encryptWithKey(sessKey,value);
     const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
-    if(message.region)cfg.region=message.region;
-    if(kind==="qwen"){cfg.chatProvider=message.provider||cfg.chatProvider||"qwen";cfg.chatModel=String(message.model||cfg.chatModel||"").trim();}
-    else{cfg.embedProvider=message.provider||cfg.embedProvider||"qwen";cfg.embedModel=String(message.model||cfg.embedModel||"").trim();}
+    if(kind==="qwen"){if(message.region)cfg.region=message.region;cfg.qwenModel=String(message.model||cfg.qwenModel||"qwen3.7-plus").trim();}
     await chrome.storage.local.set({feedVault:vault,feedConfig:cfg});
     const region=cfg.region||"intl";
     let verified=false,error="";
     try{
-      if(kind==="qwen"){await chatLLM({provider:cfg.chatProvider,apiKey:value,model:cfg.chatModel,region,system:"You are a connection test.",user:"Reply with OK.",max_tokens:5});verified=true;}
-      else{const v=await embed(["connection test"],{provider:cfg.embedProvider,apiKey:value,model:cfg.embedModel,region});verified=Array.isArray(v)&&Array.isArray(v[0])&&v[0].length>0;if(!verified)error="Provider returned no embedding vector.";}
+      if(kind==="qwen"){await chatLLM({provider:"qwen",apiKey:value,model:cfg.qwenModel,region,system:"You are a connection test.",user:"Reply with OK.",max_tokens:5});verified=true;}
+      else{const v=await embed(["connection test"],{apiKey:value});verified=Array.isArray(v)&&Array.isArray(v[0])&&v[0].length>0;if(!verified)error="OpenAI returned no embedding vector.";}
     }catch(e){error=e.message;}
     const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
     meta[kind]={set:true,verified}; await chrome.storage.local.set({feedKeyMeta:meta});
@@ -470,23 +484,22 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const urls=parseProfileLinks(message.linksText||"");
     if(!urls.length)return{ok:false,error:"No LinkedIn profile URLs found in the file or link."};
     const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
-    if(!meta.qwen?.set)return{ok:false,error:"Set the Qwen API key first."};
-    if(!meta.embeddings?.set)return{ok:false,error:"Set the Embeddings API key first."};
+    if(!meta.embeddings?.set)return{ok:false,error:"Set the OpenAI API key (embeddings) first."};
     if(!(await vaultSessionRaw()))return{ok:false,error:"Unlock the key vault with your passphrase first."};
-    const threshold=Math.max(0,Math.min(100,Number(message.threshold)||60));
+    if(!String(message.icpText||"").trim())return{ok:false,error:"Provide an ICP (icps.md file or URL) first."};
     const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
-    await chrome.storage.local.set({feedConfig:{...cfg,chatProvider:message.chatProvider||cfg.chatProvider||"qwen",chatModel:String(message.chatModel||cfg.chatModel||"").trim(),embedProvider:message.embedProvider||cfg.embedProvider||"qwen",embedModel:String(message.embedModel||cfg.embedModel||"").trim(),region:message.region||cfg.region||"intl",threshold,icpText:String(message.icpText||""),offerText:String(message.offerText||"")}});
+    await chrome.storage.local.set({feedConfig:{...cfg,qwenModel:String(message.qwenModel||cfg.qwenModel||"qwen3.7-plus").trim(),region:message.region||cfg.region||"intl",icpText:String(message.icpText||"")}});
     await chrome.storage.local.remove("feedCsv");
-    feedHeadcountCache.clear();
-    await save({mode:"feed",feedUrls:urls.slice(0,FEED_MAX),feedIndex:0,feedResults:[],feedThreshold:threshold,total:urls.length,done:0,running:false,paused:false,cancelled:false,stage:"QUEUED",message:`Queued ${urls.length} profile(s) for Feed analysis`});
+    feedEmbedCache.clear();
+    await save({mode:"feed",feedUrls:urls.slice(0,FEED_MAX),feedIndex:0,feedResults:[],total:urls.length,done:0,running:false,paused:false,cancelled:false,stage:"QUEUED",message:`Queued ${urls.length} profile(s) for ICP scoring`});
     wakeLock=true; runFeed({}).finally(()=>wakeLock=false);
     return{ok:true,count:urls.length};
   }
   if(message.type==="DOWNLOAD_FEED_CSV"){
     const state=await stored(); const results=state.feedResults||[];
-    if(results.length){const csv=buildFeedCsv(results);await chrome.storage.local.set({feedCsv:csv});await chrome.downloads.download({url:csvDataUrl(csv),filename:"lead-url-lens-feed.csv"});return{ok:true};}
+    if(results.length){const csv=buildScoreCsv(results);await chrome.storage.local.set({feedCsv:csv});await chrome.downloads.download({url:csvDataUrl(csv),filename:"icp-scores.csv"});return{ok:true};}
     const {feedCsv}=await chrome.storage.local.get("feedCsv");
-    if(feedCsv){await chrome.downloads.download({url:csvDataUrl(feedCsv),filename:"lead-url-lens-feed.csv"});return{ok:true};}
+    if(feedCsv){await chrome.downloads.download({url:csvDataUrl(feedCsv),filename:"icp-scores.csv"});return{ok:true};}
     return{ok:false,error:"No Feed results to export yet."};
   }
   return {ok: true, wakeLock};
