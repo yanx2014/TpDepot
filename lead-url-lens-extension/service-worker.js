@@ -1,5 +1,5 @@
 /* TechNFirms Lead URL Lens — user initiated, durable, inactive-tab, checkpoint safe. */
-import {parseProfileLinks, canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeCriteria, normalizedWeights, icpEmbedTexts, scoreProfile, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, buildScoreCsv, csvDataUrl, chatLLM, embed, extractJson, sha256Hex, deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier, checkVerifier, KDF_ITERATIONS} from "./feed.js";
+import {parseProfileLinks, canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeCriteria, normalizedWeights, icpEmbedTexts, scoreProfile, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, buildScoreCsv, csvDataUrl, chatLLM, embed, extractJson, sha256Hex, deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier, checkVerifier, KDF_ITERATIONS, EMBED_MODEL} from "./feed.js";
 const feedEmbedCache = new Map();
 const MAX_TARGET = 500;
 const FEED_MAX = 1000;
@@ -12,7 +12,7 @@ async function api(path, options = {}) {
   const {crm, token} = await config();
   if (!crm || !token) throw new Error("Connect and verify the CRM first");
   const request = {...options, credentials: "include", headers: {"content-type": "application/json", authorization: `Bearer ${token}`, ...options.headers}};
-  const timeoutMs=path.startsWith("/api/enrich")?120000:30000;
+  const timeoutMs=(path.startsWith("/api/enrich")||path.startsWith("/api/extension/embed")||path.startsWith("/api/extension/chat"))?120000:30000;
   let response = await timedFetch(crm + path, request, timeoutMs), data;
   try { data = await response.json(); } catch { data = {error: `CRM error ${response.status}`}; }
   if (!response.ok) { const error=new Error(data.error || `CRM error ${response.status}`); error.code=data.code||([401,403].includes(response.status)?"PAIRING_TOKEN_INVALID":"CRM_REQUEST_FAILED"); error.status=response.status; throw error; }
@@ -278,7 +278,32 @@ async function enrichQueue({importId, limit, resume = false, maxSteps = Infinity
 }
 
 /* ----------------------------------------------------------------- Feed workflow */
-async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {qwenModel:c.qwenModel||"qwen3.7-plus", region:c.region||"intl", icpText:c.icpText||""};}
+async function feedConfig(){const c=(await chrome.storage.local.get("feedConfig")).feedConfig||{};return {qwenModel:c.qwenModel||"qwen3.7-plus", region:c.region||"intl", icpText:c.icpText||"", keySource:c.keySource==="crm"?"crm":"vault"};}
+// --- CRM proxy: the connected CRM holds the OpenAI/Qwen keys server-side and forwards
+// the calls, so no API keys ever enter the browser. Requires the CRM to expose
+// POST /api/extension/embed and POST /api/extension/chat (contract in README).
+async function crmEmbed(texts){
+  if(!texts.length) return [];
+  const r=await api("/api/extension/embed",{method:"POST",body:JSON.stringify({model:EMBED_MODEL,input:texts})});
+  const vectors=r.vectors||r.embeddings||(Array.isArray(r.data)?r.data.map(d=>d.embedding):null);
+  if(!Array.isArray(vectors)) throw new Error("CRM embed proxy returned no vectors.");
+  return vectors;
+}
+async function crmChat({model,region,system,user,max_tokens,temperature,json}){
+  const r=await api("/api/extension/chat",{method:"POST",body:JSON.stringify({provider:"qwen",model,region,system,user,max_tokens,temperature,json:Boolean(json)})});
+  return String(r.content||r.text||r?.choices?.[0]?.message?.content||"").trim();
+}
+// Dispatch embeddings + chat to either the CRM proxy or the local passphrase vault keys.
+function buildFeedLlm(cfg, keys){
+  if(cfg.keySource==="crm"){
+    return {source:"crm", hasChat:true,
+      embed: texts => crmEmbed(texts),
+      chat: params => crmChat({model:cfg.qwenModel, region:cfg.region, ...params})};
+  }
+  return {source:"vault", hasChat:Boolean(keys.qwenKey),
+    embed: texts => embed(texts, {apiKey:keys.openaiKey}),
+    chat: params => chatLLM({provider:"qwen", apiKey:keys.qwenKey, model:cfg.qwenModel, region:cfg.region, ...params})};
+}
 // Passphrase vault: the derived AES key lives only in chrome.storage.session (memory,
 // cleared when the browser closes), so it survives SW restarts but locks each session.
 async function vaultSessionRaw(){return (await chrome.storage.session.get("feedSessionKey")).feedSessionKey||"";}
@@ -305,15 +330,15 @@ async function captureProfileLiteSurface(tabId, profileUrl){
 }
 // Compile the user's ICP (prose/JSON) into the scoring schema. Structured JSON is
 // used directly; prose is compiled by one cached Qwen call (keyed on the ICP hash).
-async function compileIcp(icpText, cfg, qwenKey){
+async function compileIcp(icpText, cfg, llm){
   const direct = extractJson(icpText);
   if(direct && (direct.icp?.criteria || direct.criteria)) return direct.icp ? direct : {icp:direct};
   const hash = await sha256Hex(icpText);
   const cached = (await chrome.storage.local.get("feedIcpCompiled")).feedIcpCompiled;
   if(cached && cached.hash===hash && cached.icp?.icp?.criteria) return cached.icp;
-  if(!qwenKey) throw new Error("Set the Qwen key to compile the ICP prose, or paste a structured ICP JSON.");
+  if(!llm.hasChat) throw new Error("Set the Qwen key (or use the CRM proxy) to compile the ICP prose, or paste a structured ICP JSON.");
   const {system,user,max_tokens,temperature,json}=compileIcpPrompt(icpText);
-  const text=await chatLLM({provider:"qwen",apiKey:qwenKey,model:cfg.qwenModel,region:cfg.region,system,user,max_tokens,temperature,json});
+  const text=await llm.chat({system,user,max_tokens,temperature,json});
   const parsed=extractJson(text);
   const icp = parsed?.icp?.criteria ? parsed : (parsed?.criteria ? {icp:parsed} : null);
   if(!icp || !icp.icp?.criteria) throw new Error("Could not compile the ICP into the scoring schema.");
@@ -324,14 +349,14 @@ async function compileIcp(icpText, cfg, qwenKey){
 async function resolveLocationScore(location, ctx){
   const exact = exactLocationScore(location, ctx.acceptedLocations);
   if(exact!==null) return exact;
-  if(!ctx.qwenKey) return 0.0;
+  if(!ctx.llm.hasChat) return 0.0;
   const cacheKey=`${ctx.acceptedHash}|${fold(location)}`;
   const cache=(await chrome.storage.local.get("feedLocCache")).feedLocCache||{};
   if(cacheKey in cache) return cache[cacheKey];
   let score=0.0;
   try{
     const {system,user,max_tokens,temperature,json}=locationNormalizePrompt([location], ctx.acceptedLocations);
-    const text=await chatLLM({provider:"qwen",apiKey:ctx.qwenKey,model:ctx.cfg.qwenModel,region:ctx.cfg.region,system,user,max_tokens,temperature,json});
+    const text=await ctx.llm.chat({system,user,max_tokens,temperature,json});
     const parsed=extractJson(text)||{};
     const item=(parsed.results||[]).find(r=>normText(r.input)===normText(location))||(parsed.results||[])[0];
     if(item){const s=Number(item.score),conf=Number(item.confidence);if([0,0.5,1].includes(s)&&conf>=0.75)score=s;}
@@ -350,7 +375,7 @@ async function scoreOneProfile(url, ctx){
   const payload = normText(`${rf.job_section} ${rf.headline}`) || "[missing profile text]";
   const vectors = {...ctx.icpVectors};
   try{
-    if(!ctx.embedCache.has(payload)){const [v]=await embed([payload],{apiKey:ctx.openaiKey}); if(v)ctx.embedCache.set(payload,v);}
+    if(!ctx.embedCache.has(payload)){const [v]=await ctx.llm.embed([payload]); if(v)ctx.embedCache.set(payload,v);}
     if(ctx.embedCache.has(payload)) vectors[payload]=ctx.embedCache.get(payload);
   }catch(e){row._note=`embed_error: ${e.message}`; return {row};}
   const locScore = ctx.active.locations ? await resolveLocationScore(rf.location, ctx) : 0;
@@ -370,30 +395,38 @@ async function finishFeed(state, stopReason){
 }
 async function runFeed({resume=false}={}){
   const cfg = await feedConfig();
-  const qwenKey = await vaultGet("qwen");
-  const openaiKey = await vaultGet("embeddings");
+  const crmMode = cfg.keySource==="crm";
+  let qwenKey="", openaiKey="";
+  if(crmMode){
+    const {crm,token}=await config();
+    if(!crm||!token){await save({running:false, stage:"FAILED", message:"Connect the CRM first — the CRM proxy provides the embeddings + Qwen keys."}); return;}
+  }else{
+    qwenKey = await vaultGet("qwen");
+    openaiKey = await vaultGet("embeddings");
+    if(qwenKey===null || openaiKey===null){await save({running:true, paused:true, stage:"BLOCKED", message:"Key vault is locked — unlock it with your passphrase, then press Resume."}); return;}
+    if(!openaiKey){await save({running:false, stage:"FAILED", message:"Set & verify the OpenAI key (embeddings) before running Feed."}); return;}
+  }
+  const llm = buildFeedLlm(cfg, {qwenKey, openaiKey});
   const state = await stored();
   let results = resume ? (state.feedResults||[]) : [];
   let index = resume ? Number(state.feedIndex||0) : 0;
   const urls = state.feedUrls || [];
   if(!Array.isArray(urls) || !urls.length){await save({running:false, stage:"FAILED", message:"No LinkedIn profile URLs were found in the file."}); return;}
-  if(qwenKey===null || openaiKey===null){await save({running:true, paused:true, stage:"BLOCKED", message:"Key vault is locked — unlock it with your passphrase, then press Resume."}); return;}
-  if(!openaiKey){await save({running:false, stage:"FAILED", message:"Set & verify the OpenAI key (embeddings) before running Feed."}); return;}
   await save({mode:"feed", running:true, paused:false, cancelled:false, feedUrls:urls, feedIndex:index, feedResults:results,
     total:urls.length, done:results.length, stage:"COMPILING", message: resume?"Resuming ICP scoring…":"Compiling the ICP and embedding its criteria…"});
   let active, weights, icpVectors, acceptedLocations, acceptedHash;
   try{
-    const icp = await compileIcp(cfg.icpText, cfg, qwenKey);
+    const icp = await compileIcp(cfg.icpText, cfg, llm);
     active = activeCriteria(icp.icp);
     weights = normalizedWeights(active);
     if(!weights) throw new Error("The compiled ICP has no weighted criteria.");
     const texts = icpEmbedTexts(active);
-    const vecs = texts.length ? await embed(texts, {apiKey:openaiKey}) : [];
+    const vecs = texts.length ? await llm.embed(texts) : [];
     icpVectors = {}; texts.forEach((t,i)=>{if(vecs[i])icpVectors[t]=vecs[i];});
     acceptedLocations = (active.locations?.values||[]).map(normText);
     acceptedHash = await sha256Hex(JSON.stringify(acceptedLocations));
   }catch(e){await save({running:false, stage:"FAILED", message:`ICP setup failed: ${e.message}`}); return;}
-  const ctx = {cfg, qwenKey, openaiKey, active, weights, icpVectors, acceptedLocations, acceptedHash, embedCache:feedEmbedCache};
+  const ctx = {cfg, llm, active, weights, icpVectors, acceptedLocations, acceptedHash, embedCache:feedEmbedCache};
   let stopReason="batch_complete";
   try{
     while(index < urls.length){
@@ -427,7 +460,26 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
     const vault=(await chrome.storage.local.get("feedVault")).feedVault||{};
     const cfg=await feedConfig();
-    return{ok:true,meta,hasPassphrase:Boolean(vault.kdf&&vault.verifier),unlocked:Boolean(await vaultSessionRaw()),cfg:{qwenModel:cfg.qwenModel,region:cfg.region}};
+    const {crm,token}=await config();
+    return{ok:true,meta,hasPassphrase:Boolean(vault.kdf&&vault.verifier),unlocked:Boolean(await vaultSessionRaw()),crmConnected:Boolean(crm&&token),cfg:{qwenModel:cfg.qwenModel,region:cfg.region,keySource:cfg.keySource}};
+  }
+  if(message.type==="SET_FEED_KEY_SOURCE"){
+    const src=message.source==="crm"?"crm":"vault";
+    const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
+    cfg.keySource=src; await chrome.storage.local.set({feedConfig:cfg});
+    return{ok:true,keySource:src};
+  }
+  if(message.type==="VERIFY_CRM_PROXY"){
+    const {crm,token}=await config();
+    if(!crm||!token)return{ok:false,error:"Connect the CRM first."};
+    const cfg=await feedConfig();
+    const embedResult={ok:false}, chatResult={ok:false};
+    try{const v=await crmEmbed(["connection test"]);embedResult.ok=Array.isArray(v)&&Array.isArray(v[0])&&v[0].length>0;if(!embedResult.ok)embedResult.error="CRM proxy returned no embedding vector.";}catch(e){embedResult.error=e.message;}
+    try{await crmChat({model:cfg.qwenModel,region:cfg.region,system:"You are a connection test.",user:"Reply with OK.",max_tokens:5});chatResult.ok=true;}catch(e){chatResult.error=e.message;}
+    const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
+    meta.crmProxy={embed:embedResult.ok,chat:chatResult.ok,verified:embedResult.ok&&chatResult.ok};
+    await chrome.storage.local.set({feedKeyMeta:meta});
+    return{ok:true,embed:embedResult,chat:chatResult};
   }
   if(message.type==="SET_PASSPHRASE"){
     const pass=String(message.passphrase||""); if(pass.length<6)return{ok:false,error:"Passphrase must be at least 6 characters."};
@@ -483,11 +535,17 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const state=await stored(); if(state.running)return{ok:false,error:"An operation is already running."};
     const urls=parseProfileLinks(message.linksText||"");
     if(!urls.length)return{ok:false,error:"No LinkedIn profile URLs found in the file or link."};
-    const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
-    if(!meta.embeddings?.set)return{ok:false,error:"Set the OpenAI API key (embeddings) first."};
-    if(!(await vaultSessionRaw()))return{ok:false,error:"Unlock the key vault with your passphrase first."};
-    if(!String(message.icpText||"").trim())return{ok:false,error:"Provide an ICP (icps.md file or URL) first."};
     const cfg=(await chrome.storage.local.get("feedConfig")).feedConfig||{};
+    const crmMode=(cfg.keySource==="crm");
+    if(crmMode){
+      const {crm,token}=await config();
+      if(!crm||!token)return{ok:false,error:"Connect the CRM first — it proxies the embeddings + Qwen keys."};
+    }else{
+      const meta=(await chrome.storage.local.get("feedKeyMeta")).feedKeyMeta||{};
+      if(!meta.embeddings?.set)return{ok:false,error:"Set the OpenAI API key (embeddings) first, or switch API keys source to CRM proxy."};
+      if(!(await vaultSessionRaw()))return{ok:false,error:"Unlock the key vault with your passphrase first."};
+    }
+    if(!String(message.icpText||"").trim())return{ok:false,error:"Provide an ICP (icps.md file or URL) first."};
     await chrome.storage.local.set({feedConfig:{...cfg,qwenModel:String(message.qwenModel||cfg.qwenModel||"qwen3.7-plus").trim(),region:message.region||cfg.region||"intl",icpText:String(message.icpText||"")}});
     await chrome.storage.local.remove("feedCsv");
     feedEmbedCache.clear();

@@ -28,7 +28,23 @@ The token is verified before use and is hidden after connection. Collection uses
 
 The **Feed** tab scores a list of LinkedIn profiles against a user-defined ICP and exports a CSV. It implements the generalized `icp-scoring` skill (`icp-scoring-skill/` in this repo): OpenAI embeddings + deterministic rules in code; the LLM never computes the score.
 
-### Passphrase-gated key vault
+### API keys source
+
+The **API keys source** selector (top of the Feed tab) chooses where the OpenAI (embeddings) and Qwen (compile/location) calls get their keys:
+
+- **CRM proxy** — the extension sends every embedding and Qwen request to the connected CRM, which holds the API keys **server-side** and forwards them to OpenAI / Qwen. **No API keys are ever stored in or transit the browser.** This is the recommended option. Press **Verify CRM proxy** to confirm the CRM implements the two endpoints. Requires only that the CRM be connected (pairing token) — the passphrase vault below is not used.
+- **Local encrypted vault** — the extension calls OpenAI / DashScope directly using keys you store in the passphrase-gated vault (below). Use this if the CRM does not proxy LLM calls.
+
+#### CRM proxy contract
+
+For the CRM-proxy option the CRM at `lead-url-lens-crm.yann-brou222.chatgpt.site` must expose two authenticated endpoints (same Bearer pairing token + `credentials: include` as the other `/api/extension/*` routes):
+
+- `POST /api/extension/embed` — body `{ "model": "text-embedding-3-small", "input": ["…", "…"] }` → `{ "vectors": [[…], […]] }` (the extension also accepts an OpenAI-shaped `{ "data": [{ "embedding": [...] }] }` or `{ "embeddings": [...] }`). The CRM forwards to OpenAI with its own key.
+- `POST /api/extension/chat` — body `{ "provider": "qwen", "model": "qwen3.7-plus", "region": "intl|cn", "system": "…", "user": "…", "max_tokens": N, "temperature": 0, "json": true }` → `{ "content": "…" }` (also accepts `{ "text": "…" }` or an OpenAI-shaped `{ "choices": [{ "message": { "content": "…" } }] }`). The CRM forwards to Qwen/DashScope (or any model it maps `provider` to) with its own key.
+
+The extension never sees the keys in this mode; the CRM is responsible for holding them and enforcing its own rate limits.
+
+### Passphrase-gated key vault (local vault option only)
 
 Keys are protected by a **passphrase you enter once per browser session** — never stored. It derives an AES-256 key via **PBKDF2** (210k iterations, SHA-256) that encrypts your API keys (AES-GCM) at rest. **Unlock** each session (the derived key lives only in `chrome.storage.session`, so it survives service-worker restarts but clears when the browser closes); **Lock** clears it now; **Change** re-encrypts under a new passphrase. Keys can only be set/used while unlocked.
 
@@ -67,4 +83,6 @@ Score is an integer 0–100 or `NOT COMPUTED`. One row per distinct result, cano
 ## Install (Feed / dev)
 
 1. Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, select the `lead-url-lens-extension` folder.
-2. In the Feed tab: set a vault passphrase → **Unlock** → **Save & verify** the OpenAI key (and Qwen key) → choose the profiles + ICP files → **Run ICP scoring**.
+2. In the Feed tab, pick an **API keys source**:
+   - **CRM proxy:** connect the CRM (pairing token) → **Verify CRM proxy** → choose the profiles + ICP files → **Run ICP scoring**.
+   - **Local encrypted vault:** set a vault passphrase → **Unlock** → **Save & verify** the OpenAI key (and Qwen key) → choose the profiles + ICP files → **Run ICP scoring**.
