@@ -1,4 +1,4 @@
-# Local Lead URL Lens 1.0.0
+# Local Lead URL Lens 1.1.0
 
 A standalone Manifest V3 extension that **captures LinkedIn People Search / Sales Navigator prospects and scores them locally against your ICP, then downloads a CSV** — with **no backend and no CRM**. It is a separate extension from the CRM-connected *Lead URL Lens*; nothing here talks to `lead-url-lens-crm…chatgpt.site`.
 
@@ -25,6 +25,17 @@ Each term is in `[0,1]`; the weights **65 / 20 / 15 are fixed** (they are the co
 - **Location (15)** — `1.0` if an accepted location equals or contains the displayed location; `0.5`/`0` via one cached Qwen normalization if a Qwen key is set; otherwise `0`.
 
 Semantic matches use **OpenAI `text-embedding-3-small`** (the contract mandates embeddings; it is never substituted). If a required embedding cannot be produced for a prospect, that row is **`NOT COMPUTED`** — never an invented value, exactly as the backend behaves.
+
+## Accuracy improvements (v1.1.0 — explicit, not silent)
+
+The 65/20/15 weights and the deterministic rule are unchanged. What improved is how each term is *measured*:
+
+- **Lexical exact match first.** If an accepted title/keyword appears in the prospect's text as a whole word/phrase (accent- and case-insensitive), that term scores **1.0** directly — no embedding needed (this also rescues rows whose embeddings failed).
+- **Cosine calibration.** Raw embedding cosines compress the range (~0.25–0.40 even for unrelated jobs). Calibration maps cosine **≤ 0.35 → 0** and **≥ 0.80 → 1** (linear between) before the weights apply, so wrong profiles fall toward 0 and near-synonyms toward 100. Constants: `CALIBRATION` in `feed.js`.
+- **ICP variant expansion (needs Qwen key).** One cached Qwen call expands your accepted titles/keywords into strict same-role variants — synonyms, abbreviations ("VP"/"Vice President"), and French/English translations ("Sales Director"/"Directeur Commercial"). Scoring takes the max over originals ∪ variants; your accepted values stay authoritative, and you can supply your own `job_title_variants` / `keyword_variants` lists in a structured ICP to skip Qwen.
+- **Persistent caches.** ICP criterion embeddings, location verdicts, and Qwen reviews persist across runs in `chrome.storage.local` (same ICP → no re-embedding, consistent location decisions, fewer API calls). Profile-text embeddings are reused within a run.
+- **Private/empty cards flagged.** Cards with no visible name, headline, or job section (e.g. private "LinkedIn Member" results) are exported as `NOT COMPUTED` with `private_or_empty_profile` in the **Note** column instead of a meaningless low score.
+- **Advisory Qwen Review (needs Qwen key).** Borderline scores (**40–70**) get one cached Qwen audit whose verdict (`fit` / `no fit` / `uncertain` + a short reason) appears in the **Qwen Review** CSV column. It is advisory only — **it never changes the numeric score** (the LLM never assigns points).
 
 ## Keys (local, encrypted, no backend)
 
@@ -53,10 +64,10 @@ Paste text, choose a file, or set a raw URL. Either:
 `local-lead-icp-scores.csv` — UTF-8, **semicolon-delimited**, columns:
 
 ```
-Full Name;Job Title;Job Section;Headline;Location;ICP Search Score;Job Title (65);Job Section/Headline (20);Location (15);LinkedIn Url
+Full Name;Job Title;Job Section;Headline;Location;ICP Search Score;Job Title (65);Job Section/Headline (20);Location (15);Qwen Review;Note;LinkedIn Url
 ```
 
-`ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; the three component columns show each sub-match as a percentage. One row per distinct prospect (canonical-URL deduplicated).
+`ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; the three component columns show each sub-match as a percentage. `Qwen Review` holds the advisory verdict for borderline (40–70) scores when a Qwen key is set; `Note` explains `NOT COMPUTED` rows (`private_or_empty_profile`, `embeddings_unavailable`). One row per distinct prospect (canonical-URL deduplicated).
 
 ## Install
 

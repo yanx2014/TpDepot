@@ -15,9 +15,14 @@
 // FIXED scoring contract weights (Job Title 65 · Job Section/Headline 20 · Location 15).
 export const WEIGHTS = { job_title: 0.65, job_section_headline: 0.20, location: 0.15 };
 export const EMBED_MODEL = "text-embedding-3-small";
+// Cosine calibration for embedding matches: raw cosines from text-embedding-3-small
+// cluster (~0.25-0.40 unrelated, ~0.80+ near-synonym), so raw values compress the
+// 0-100 range. Cosine ≤ floor scores 0, ≥ ceil scores 1, linear in between.
+export const CALIBRATION = { floor: 0.35, ceil: 0.80 };
 export const SCORE_CSV_HEADERS = [
   "Full Name", "Job Title", "Job Section", "Headline", "Location",
-  "ICP Search Score", "Job Title (65)", "Job Section/Headline (20)", "Location (15)", "LinkedIn Url",
+  "ICP Search Score", "Job Title (65)", "Job Section/Headline (20)", "Location (15)",
+  "Qwen Review", "Note", "LinkedIn Url",
 ];
 
 /* ------------------------------------------------------------------ parsing */
@@ -90,7 +95,12 @@ export function activeIcp(icp) {
     const values = Array.isArray(v) ? v : (v && Array.isArray(v.values) ? v.values : []);
     return values.map(normText).filter(Boolean);
   };
-  return { job_titles: list("job_titles"), keywords: list("keywords"), locations: list("locations") };
+  return {
+    job_titles: list("job_titles"), keywords: list("keywords"), locations: list("locations"),
+    // Optional Qwen-generated variants (synonyms / abbreviations / FR-EN translations);
+    // scoring takes the max over originals ∪ variants — the accepted values stay authoritative.
+    job_title_variants: list("job_title_variants"), keyword_variants: list("keyword_variants"),
+  };
 }
 // Qwen prompt: compile a prose/markdown ICP into the accepted-value lists (one cached call).
 // Weights are NOT requested — they are fixed by the contract.
@@ -103,6 +113,24 @@ export function compileIcpPrompt(icpText) {
 }}
 Rules: include a list ONLY if the ICP supplies values for it (use an empty array otherwise). If the ICP contains multiple sub-ICPs, merge their titles/keywords/locations into the single lists. Do NOT output weights.`;
   return { system, user: `ICP:\n${icpText}`, max_tokens: 1500, temperature: 0, json: true };
+}
+// Qwen prompt: expand accepted titles/keywords into strict variants (synonyms,
+// abbreviations, FR-EN translations). One cached call; expansion is best-effort and
+// only widens matching — the accepted values and the scoring rule are unchanged.
+export function expandIcpPrompt(icp) {
+  const system = `You expand accepted ICP values for LinkedIn lead scoring. For each accepted job title and keyword, generate close variants a matching profile might display instead: common synonyms, standard abbreviations (e.g. "VP" / "Vice President"), and French/English translations. Stay strictly equivalent in seniority and function — never broaden to a different role or a more junior/senior level. Output ONLY a JSON object: {"job_title_variants":["…"],"keyword_variants":["…"]} containing ONLY the new variants (not the originals).`;
+  const user = JSON.stringify({ job_titles: icp.job_titles, keywords: icp.keywords });
+  return { system, user, max_tokens: 1200, temperature: 0, json: true };
+}
+// Qwen prompt: advisory review of one borderline prospect. The verdict goes in its own
+// CSV column and NEVER changes the numeric score (the LLM never assigns points).
+export function reviewPrompt(rf, icp) {
+  const system = `You audit one LinkedIn prospect against an ICP. Judge ONLY from the provided facts; never invent data. Output ONLY a JSON object: {"verdict":"fit|no_fit|uncertain","reason":"<max 12 words citing the decisive fact>"}. This is an advisory review; it does not change any score.`;
+  const user = JSON.stringify({
+    icp: { job_titles: icp.job_titles, keywords: icp.keywords, locations: icp.locations },
+    prospect: { job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline, location: rf.location },
+  });
+  return { system, user, max_tokens: 120, temperature: 0, json: true };
 }
 // Qwen prompt: resolve an unresolved displayed location against accepted geography.
 export function locationNormalizePrompt(displayed, accepted) {
@@ -124,6 +152,25 @@ export function exactLocationScore(location, accepted) {
   for (const item of accepted) { const f = fold(item); if (f && (f === loc || loc.includes(f))) return 1.0; }
   return null;
 }
+// Calibrated embedding match: cosine ≤ floor → 0, ≥ ceil → 1, linear in between.
+export function calibrate(cos) {
+  if (cos === null || cos === undefined) return null;
+  return Math.max(0, Math.min(1, (cos - CALIBRATION.floor) / (CALIBRATION.ceil - CALIBRATION.floor)));
+}
+// Lexical exact/whole-phrase match: true when an accepted value appears in the text as a
+// whole word/phrase (accent- and case-insensitive). A lexical hit scores the term 1.0
+// without needing embeddings.
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+export function lexicalMatch(text, values) {
+  const t = fold(text);
+  if (!t) return false;
+  for (const v of values) {
+    const f = fold(v);
+    if (!f || f.length < 2) continue;
+    if (new RegExp(`(?:^|[^a-z0-9])${escapeRe(f)}(?:[^a-z0-9]|$)`).test(t)) return true;
+  }
+  return false;
+}
 // Best cosine of `text` against a list of accepted values, using the shared vector map.
 function bestMatch(text, values, vectors) {
   const tv = vectors[normText(text)];
@@ -132,19 +179,27 @@ function bestMatch(text, values, vectors) {
   for (const v of values) { const ov = vectors[normText(v)]; if (ov) best = Math.max(best, cosine(tv, ov)); }
   return best;
 }
+// One weighted term: lexical exact match first (1.0, rescues missing embeddings), else
+// calibrated best-cosine via embeddings (null → NOT COMPUTED decided by the caller).
+function matchTerm(text, values, vectors) {
+  if (!values.length) return 0;
+  if (lexicalMatch(text, values)) return 1.0;
+  return calibrate(bestMatch(text, values, vectors));
+}
 // Score one captured row against the ICP. `vectors` maps normalized text → embedding.
 // Returns {score, job_title, job_section_headline, location} where score is an integer
 // 0–100 or "NOT COMPUTED" when a required semantic embedding could not be produced.
 export function scoreRow(rf, icp, vectors, locationScore) {
   const jobTitleText = rf.job_title || "";
   const sectionHeadlineText = normText(`${rf.job_section} ${rf.headline}`);
-  const semanticValues = [...new Set([...icp.job_titles, ...icp.keywords])];
+  const titleValues = [...new Set([...icp.job_titles, ...(icp.job_title_variants || [])])];
+  const semanticValues = [...new Set([...titleValues, ...icp.keywords, ...(icp.keyword_variants || [])])];
 
-  // Job Title (65): profile title vs accepted job titles.
-  const jt = icp.job_titles.length ? bestMatch(jobTitleText || sectionHeadlineText, icp.job_titles, vectors) : 0;
-  // Job Section/Headline (20): section+headline text vs accepted titles ∪ keywords.
-  const jsh = semanticValues.length ? bestMatch(sectionHeadlineText || jobTitleText, semanticValues, vectors) : 0;
-  if ((icp.job_titles.length && jt === null) || (semanticValues.length && jsh === null)) {
+  // Job Title (65): profile title vs accepted job titles (∪ variants).
+  const jt = icp.job_titles.length ? matchTerm(jobTitleText || sectionHeadlineText, titleValues, vectors) : 0;
+  // Job Section/Headline (20): section+headline text vs accepted titles ∪ keywords (∪ variants).
+  const jsh = semanticValues.length ? matchTerm(sectionHeadlineText || jobTitleText, semanticValues, vectors) : 0;
+  if (jt === null || jsh === null) {
     return { score: "NOT COMPUTED", job_title: null, job_section_headline: null, location: locationScore };
   }
   const loc = icp.locations.length ? (Number.isFinite(locationScore) ? locationScore : 0) : 0;
@@ -156,9 +211,12 @@ export function scoreRow(rf, icp, vectors, locationScore) {
     location: loc,
   };
 }
-// Every embeddable ICP text (accepted job titles ∪ keywords) plus the per-profile texts.
+// Every embeddable ICP text (accepted job titles ∪ keywords, incl. variants).
 export function icpEmbedTexts(icp) {
-  return [...new Set([...icp.job_titles, ...icp.keywords].map(normText).filter(Boolean))];
+  return [...new Set([
+    ...icp.job_titles, ...icp.keywords,
+    ...(icp.job_title_variants || []), ...(icp.keyword_variants || []),
+  ].map(normText).filter(Boolean))];
 }
 
 /* --------------------------------------------------------------- CSV (semicolon) */
@@ -172,7 +230,8 @@ export function buildScoreCsv(rows) {
   for (const r of rows) {
     lines.push([
       r.full_name, r.job_title, r.job_section, r.headline, r.location,
-      r.icp_score, pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location), r.linkedin_url,
+      r.icp_score, pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location),
+      r.qwen_review || "", r.note || "", r.linkedin_url,
     ].map(csvCell).join(";"));
   }
   return "﻿" + lines.join("\r\n"); // UTF-8 BOM (utf-8-sig parity)

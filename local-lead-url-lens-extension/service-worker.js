@@ -5,9 +5,10 @@
  * passphrase-gated vault; all scoring math is deterministic in code. */
 import {
   canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeIcp, icpEmbedTexts,
-  scoreRow, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, buildScoreCsv,
-  csvDataUrl, chatLLM, embed, extractJson, sha256Hex, deriveVaultKey, exportKeyRaw,
-  importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier, checkVerifier, KDF_ITERATIONS,
+  scoreRow, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, expandIcpPrompt,
+  reviewPrompt, buildScoreCsv, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
+  deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier,
+  checkVerifier, KDF_ITERATIONS,
 } from "./feed.js";
 
 const MAX_TARGET = 1000;
@@ -109,15 +110,48 @@ async function compileIcp(icpText, cfg, qwenKey) {
   await chrome.storage.local.set({localIcpCompiled: {hash, icp: parsed}});
   return parsed;
 }
+// Best-effort Qwen expansion of accepted titles/keywords into strict variants
+// (synonyms / abbreviations / FR-EN translations). Cached by content hash; a failure
+// simply leaves the ICP unexpanded — the accepted values always stay authoritative.
+async function expandIcpValues(icp, cfg, qwenKey) {
+  if (!qwenKey || (!icp.job_titles.length && !icp.keywords.length)) return icp;
+  if (icp.job_title_variants.length || icp.keyword_variants.length) return icp; // user supplied their own
+  const hash = await sha256Hex(JSON.stringify([icp.job_titles, icp.keywords]));
+  const cached = (await chrome.storage.local.get("localIcpExpanded")).localIcpExpanded;
+  if (cached && cached.hash === hash) return {...icp, job_title_variants: cached.job_title_variants || [], keyword_variants: cached.keyword_variants || []};
+  try {
+    const {system, user, max_tokens, temperature, json} = expandIcpPrompt(icp);
+    const text = await chatLLM({apiKey: qwenKey, model: cfg.qwenModel, region: cfg.region, system, user, max_tokens, temperature, json});
+    const parsed = extractJson(text) || {};
+    const jtv = (Array.isArray(parsed.job_title_variants) ? parsed.job_title_variants : []).map(normText).filter(Boolean);
+    const kwv = (Array.isArray(parsed.keyword_variants) ? parsed.keyword_variants : []).map(normText).filter(Boolean);
+    await chrome.storage.local.set({localIcpExpanded: {hash, job_title_variants: jtv, keyword_variants: kwv}});
+    return {...icp, job_title_variants: jtv, keyword_variants: kwv};
+  } catch { return icp; }
+}
 async function buildScoringCtx(cfg, openaiKey, qwenKey) {
   const raw = await compileIcp(cfg.icpText, cfg, qwenKey);
-  const icp = activeIcp(raw);
+  let icp = activeIcp(raw);
   if (!icp.job_titles.length && !icp.keywords.length && !icp.locations.length) throw new Error("The ICP has no accepted values (job titles, keywords, or locations).");
+  icp = await expandIcpValues(icp, cfg, qwenKey);
+  // ICP criterion vectors persist across runs (same ICP → no re-embedding).
   const icpTexts = icpEmbedTexts(icp);
-  const vecs = icpTexts.length ? await embed(icpTexts, {apiKey: openaiKey}) : []; // also validates the OpenAI key
-  const icpVectors = {}; icpTexts.forEach((t, i) => { if (vecs[i]) icpVectors[t] = vecs[i]; });
+  const textsHash = await sha256Hex(JSON.stringify(icpTexts));
+  const storedVecs = (await chrome.storage.local.get("localIcpVectors")).localIcpVectors;
+  let icpVectors = {};
+  if (storedVecs && storedVecs.hash === textsHash && storedVecs.vectors && Object.keys(storedVecs.vectors).length) {
+    icpVectors = storedVecs.vectors;
+    await embed(["connection test"], {apiKey: openaiKey}); // still validate the key up front
+  } else {
+    const vecs = icpTexts.length ? await embed(icpTexts, {apiKey: openaiKey}) : []; // also validates the OpenAI key
+    icpTexts.forEach((t, i) => { if (vecs[i]) icpVectors[t] = vecs[i]; });
+    await chrome.storage.local.set({localIcpVectors: {hash: textsHash, vectors: icpVectors}});
+  }
   const acceptedHash = await sha256Hex(JSON.stringify(icp.locations));
-  return {cfg, icp, openaiKey, qwenKey, icpVectors, acceptedHash, locCache: {}};
+  const icpHash = await sha256Hex(JSON.stringify([icp.job_titles, icp.keywords, icp.locations]));
+  // Location verdicts persist across runs too.
+  const locCache = (await chrome.storage.local.get("localLocCache")).localLocCache || {};
+  return {cfg, icp, openaiKey, qwenKey, icpVectors, acceptedHash, icpHash, locCache, embedCache: new Map()};
 }
 async function resolveLocationScore(location, ctx) {
   const exact = exactLocationScore(location, ctx.icp.locations);
@@ -133,25 +167,55 @@ async function resolveLocationScore(location, ctx) {
     const item = (parsed.results || []).find(r => normText(r.input) === normText(location)) || (parsed.results || [])[0];
     if (item) { const s = Number(item.score), conf = Number(item.confidence); if ([0, 0.5, 1].includes(s) && conf >= 0.75) score = s; }
   } catch {}
-  ctx.locCache[key] = score; return score;
+  ctx.locCache[key] = score;
+  try { await chrome.storage.local.set({localLocCache: ctx.locCache}); } catch {}
+  return score;
+}
+// Advisory Qwen review of one borderline-scored prospect (40-70). Cached; the verdict
+// goes in its own CSV column and NEVER changes the numeric score.
+const REVIEW_BAND = { min: 40, max: 70 };
+async function qwenReview(rf, ctx) {
+  const key = await sha256Hex(`${ctx.icpHash}|${rf.linkedin_url}|${rf.job_title}|${rf.job_section}|${rf.headline}|${rf.location}`);
+  const cache = (await chrome.storage.local.get("localReviewCache")).localReviewCache || {};
+  if (cache[key]) return cache[key];
+  let out = "";
+  try {
+    const {system, user, max_tokens, temperature, json} = reviewPrompt(rf, ctx.icp);
+    const text = await chatLLM({apiKey: ctx.qwenKey, model: ctx.cfg.qwenModel, region: ctx.cfg.region, system, user, max_tokens, temperature, json});
+    const parsed = extractJson(text) || {};
+    if (["fit", "no_fit", "uncertain"].includes(parsed.verdict)) out = `${parsed.verdict.replace("_", " ")}${parsed.reason ? `: ${String(parsed.reason).slice(0, 90)}` : ""}`;
+  } catch {}
+  if (out) { cache[key] = out; try { await chrome.storage.local.set({localReviewCache: cache}); } catch {} }
+  return out;
 }
 // Score one page of newly-captured rows locally. Returns output rows (with sub-scores).
 async function scorePageRows(rows, ctx) {
   const fields = rows.map(r => rowFieldsFromCapture(r));
+  // Rows with no visible name/headline/section (private "LinkedIn Member" cards) carry
+  // no scorable evidence — flag them instead of producing a meaningless low score.
+  const scorable = fields.filter(rf => rf.full_name || rf.headline || rf.job_section);
   const texts = new Set();
-  for (const rf of fields) { if (rf.job_title) texts.add(normText(rf.job_title)); const sh = normText(`${rf.job_section} ${rf.headline}`); if (sh) texts.add(sh); }
+  for (const rf of scorable) { if (rf.job_title) texts.add(normText(rf.job_title)); const sh = normText(`${rf.job_section} ${rf.headline}`); if (sh) texts.add(sh); }
   const vectors = {...ctx.icpVectors};
+  for (const t of texts) if (ctx.embedCache.has(t)) vectors[t] = ctx.embedCache.get(t); // run-level reuse across pages
   const wanted = [...texts].filter(t => !(t in vectors));
-  if (wanted.length) { try { const vecs = await embed(wanted, {apiKey: ctx.openaiKey}); wanted.forEach((t, i) => { if (vecs[i]) vectors[t] = vecs[i]; }); } catch (e) { /* leave unmapped → NOT COMPUTED */ } }
+  if (wanted.length) { try { const vecs = await embed(wanted, {apiKey: ctx.openaiKey}); wanted.forEach((t, i) => { if (vecs[i]) { vectors[t] = vecs[i]; ctx.embedCache.set(t, vecs[i]); } }); } catch (e) { /* leave unmapped → NOT COMPUTED */ } }
   const out = [];
   for (const rf of fields) {
+    const base = {
+      full_name: rf.full_name, job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline,
+      location: rf.location, linkedin_url: rf.linkedin_url, qwen_review: "", note: "",
+    };
+    if (!rf.full_name && !rf.headline && !rf.job_section) {
+      out.push({...base, icp_score: "NOT COMPUTED", c_job_title: null, c_job_section_headline: null, c_location: null, note: "private_or_empty_profile"});
+      continue;
+    }
     const locScore = ctx.icp.locations.length ? await resolveLocationScore(rf.location, ctx) : 0;
     const s = scoreRow(rf, ctx.icp, vectors, locScore);
-    out.push({
-      full_name: rf.full_name, job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline,
-      location: rf.location, linkedin_url: rf.linkedin_url, icp_score: s.score,
-      c_job_title: s.job_title, c_job_section_headline: s.job_section_headline, c_location: s.location,
-    });
+    const row = {...base, icp_score: s.score, c_job_title: s.job_title, c_job_section_headline: s.job_section_headline, c_location: s.location};
+    if (s.score === "NOT COMPUTED") row.note = "embeddings_unavailable";
+    else if (ctx.qwenKey && s.score >= REVIEW_BAND.min && s.score <= REVIEW_BAND.max) row.qwen_review = await qwenReview(rf, ctx);
+    out.push(row);
   }
   return out;
 }
