@@ -1,4 +1,4 @@
-# Local Lead URL Lens 1.1.0
+# Local Lead URL Lens 1.2.0
 
 A standalone Manifest V3 extension that **captures LinkedIn People Search / Sales Navigator prospects and scores them locally against your ICP, then downloads a CSV** — with **no backend and no CRM**. It is a separate extension from the CRM-connected *Lead URL Lens*; nothing here talks to `lead-url-lens-crm…chatgpt.site`.
 
@@ -30,7 +30,8 @@ Semantic matches use **OpenAI `text-embedding-3-small`** (the contract mandates 
 
 The 65/20/15 weights and the deterministic rule are unchanged. What improved is how each term is *measured*:
 
-- **Lexical exact match first.** If an accepted title/keyword appears in the prospect's text as a whole word/phrase (accent- and case-insensitive), that term scores **1.0** directly — no embedding needed (this also rescues rows whose embeddings failed).
+- **Lexical exact match first (inflection-tolerant since v1.2.0).** If an accepted title/keyword appears in the prospect's text as a whole word/phrase, that term scores **1.0** directly — no embedding needed (this also rescues rows whose embeddings failed). Matching is accent- and case-insensitive, skips FR/EN function words (*de, du, chez, of, at…*), and normalizes standard French gender/plural endings so **"Fondatrice" matches "Fondateur"**, "Directrices" matches "Directeur", "Consultante" matches "Consultant". Tokens compare by equality, never substring — "directorate" still does not match "director".
+- **Gender-complete variant expansion (v1.2.0).** The Qwen expansion now always emits both French masculine **and feminine** role forms, plurals, and both short-role and role+domain forms; the expansion cache is versioned so improved prompts regenerate variants for an unchanged ICP.
 - **Cosine calibration.** Raw embedding cosines compress the range (~0.25–0.40 even for unrelated jobs). Calibration maps cosine **≤ 0.35 → 0** and **≥ 0.80 → 1** (linear between) before the weights apply, so wrong profiles fall toward 0 and near-synonyms toward 100. Constants: `CALIBRATION` in `feed.js`.
 - **ICP variant expansion (needs Qwen key).** One cached Qwen call expands your accepted titles/keywords into strict same-role variants — synonyms, abbreviations ("VP"/"Vice President"), and French/English translations ("Sales Director"/"Directeur Commercial"). Scoring takes the max over originals ∪ variants; your accepted values stay authoritative, and you can supply your own `job_title_variants` / `keyword_variants` lists in a structured ICP to skip Qwen.
 - **Persistent caches.** ICP criterion embeddings, location verdicts, and Qwen reviews persist across runs in `chrome.storage.local` (same ICP → no re-embedding, consistent location decisions, fewer API calls). Profile-text embeddings are reused within a run.

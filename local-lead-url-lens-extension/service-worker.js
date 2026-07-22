@@ -116,7 +116,10 @@ async function compileIcp(icpText, cfg, qwenKey) {
 async function expandIcpValues(icp, cfg, qwenKey) {
   if (!qwenKey || (!icp.job_titles.length && !icp.keywords.length)) return icp;
   if (icp.job_title_variants.length || icp.keyword_variants.length) return icp; // user supplied their own
-  const hash = await sha256Hex(JSON.stringify([icp.job_titles, icp.keywords]));
+  // EXPANSION_VERSION salts the cache so an improved expansion prompt regenerates
+  // variants for an unchanged ICP (v2 added FR masculine+feminine forms).
+  const EXPANSION_VERSION = "v2";
+  const hash = await sha256Hex(`${EXPANSION_VERSION}|${JSON.stringify([icp.job_titles, icp.keywords])}`);
   const cached = (await chrome.storage.local.get("localIcpExpanded")).localIcpExpanded;
   if (cached && cached.hash === hash) return {...icp, job_title_variants: cached.job_title_variants || [], keyword_variants: cached.keyword_variants || []};
   try {

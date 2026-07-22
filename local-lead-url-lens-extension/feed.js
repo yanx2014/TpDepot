@@ -118,9 +118,9 @@ Rules: include a list ONLY if the ICP supplies values for it (use an empty array
 // abbreviations, FR-EN translations). One cached call; expansion is best-effort and
 // only widens matching — the accepted values and the scoring rule are unchanged.
 export function expandIcpPrompt(icp) {
-  const system = `You expand accepted ICP values for LinkedIn lead scoring. For each accepted job title and keyword, generate close variants a matching profile might display instead: common synonyms, standard abbreviations (e.g. "VP" / "Vice President"), and French/English translations. Stay strictly equivalent in seniority and function — never broaden to a different role or a more junior/senior level. Output ONLY a JSON object: {"job_title_variants":["…"],"keyword_variants":["…"]} containing ONLY the new variants (not the originals).`;
+  const system = `You expand accepted ICP values for LinkedIn lead scoring. For each accepted job title and keyword, generate close variants a matching profile might display instead: common synonyms, standard abbreviations (e.g. "VP" / "Vice President"), and French/English translations. For every French role word ALWAYS include BOTH the masculine and feminine forms (Fondateur AND Fondatrice, Directeur AND Directrice, Consultant AND Consultante) and common plurals. For roles tied to a domain, include BOTH the short role form ("Fondateur") and the role-plus-domain form ("Fondateur de cabinet de recrutement"). Stay strictly equivalent in seniority and function — never broaden to a different role or a more junior/senior level. Output ONLY a JSON object: {"job_title_variants":["…"],"keyword_variants":["…"]} containing ONLY the new variants (not the originals).`;
   const user = JSON.stringify({ job_titles: icp.job_titles, keywords: icp.keywords });
-  return { system, user, max_tokens: 1200, temperature: 0, json: true };
+  return { system, user, max_tokens: 1500, temperature: 0, json: true };
 }
 // Qwen prompt: advisory review of one borderline prospect. The verdict goes in its own
 // CSV column and NEVER changes the numeric score (the LLM never assigns points).
@@ -157,17 +157,40 @@ export function calibrate(cos) {
   if (cos === null || cos === undefined) return null;
   return Math.max(0, Math.min(1, (cos - CALIBRATION.floor) / (CALIBRATION.ceil - CALIBRATION.floor)));
 }
-// Lexical exact/whole-phrase match: true when an accepted value appears in the text as a
-// whole word/phrase (accent- and case-insensitive). A lexical hit scores the term 1.0
-// without needing embeddings.
-const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Lexical exact/whole-phrase match, inflection- and stopword-tolerant. Both sides are
+// folded, tokenized, stripped of FR/EN function words, and normalized for standard
+// French gender/plural endings ("Fondatrice" ≡ "Fondateur", "Directrices" ≡ "Directeur",
+// "Consultante" ≡ "Consultant"). The accepted value's content tokens must then appear as
+// a contiguous whole-token sequence in the text — tokens compare by equality, never by
+// substring, so "directorate" still does not match "director". A lexical hit scores the
+// term 1.0 without needing embeddings.
+const LEXICAL_STOPWORDS = new Set(["a", "an", "and", "at", "au", "aux", "chez", "d", "dans", "de", "des", "du", "en", "et", "for", "in", "l", "la", "le", "les", "of", "or", "ou", "the", "to", "un", "une", "with"]);
+export function normalizeToken(token) {
+  let t = token;
+  if (t.length > 3 && t.endsWith("s")) t = t.slice(0, -1);                       // plural
+  if (t.length > 5 && t.endsWith("trice")) t = t.slice(0, -5) + "teur";          // fondatrice→fondateur
+  else if (t.length > 4 && t.endsWith("euse")) t = t.slice(0, -4) + "eur";       // vendeuse→vendeur
+  else if (t.length > 3 && t.endsWith("ere")) t = t.slice(0, -3) + "er";         // conseillere→conseiller (accents folded)
+  else if (t.length > 3 && t.endsWith("ive")) t = t.slice(0, -3) + "if";         // sportive→sportif
+  else if (t.length > 4 && t.endsWith("e")) t = t.slice(0, -1);                  // consultante→consultant
+  return t;
+}
+export function contentTokens(value) {
+  return (fold(value).match(/[a-z0-9]+/g) || [])
+    .filter(t => !LEXICAL_STOPWORDS.has(t))
+    .map(normalizeToken);
+}
 export function lexicalMatch(text, values) {
-  const t = fold(text);
-  if (!t) return false;
+  const tt = contentTokens(text);
+  if (!tt.length) return false;
   for (const v of values) {
-    const f = fold(v);
-    if (!f || f.length < 2) continue;
-    if (new RegExp(`(?:^|[^a-z0-9])${escapeRe(f)}(?:[^a-z0-9]|$)`).test(t)) return true;
+    const vt = contentTokens(v);
+    if (!vt.length || (vt.length === 1 && vt[0].length < 2)) continue;
+    for (let i = 0; i + vt.length <= tt.length; i++) {
+      let hit = true;
+      for (let j = 0; j < vt.length; j++) if (tt[i + j] !== vt[j]) { hit = false; break; }
+      if (hit) return true;
+    }
   }
   return false;
 }
