@@ -19,13 +19,16 @@ export const EMBED_MODEL = "text-embedding-3-small";
 // cluster (~0.25-0.40 unrelated, ~0.80+ near-synonym), so raw values compress the
 // 0-100 range. Cosine ≤ floor scores 0, ≥ ceil scores 1, linear in between.
 export const CALIBRATION = { floor: 0.35, ceil: 0.80 };
-// Numeric scores at or above this threshold export as "qualified", below (and
-// NOT COMPUTED) as "unqualified".
+// Numeric scores at or above this threshold export as "qualified" (subject to the
+// two-factor audit below); below (and NOT COMPUTED) as "unqualified".
 export const QUALIFICATION_THRESHOLD = 75;
+// Only rows scoring at/above this floor are eligible for the (paid) Qwen fit audit;
+// clearly-low rows are rejected deterministically with no token cost.
+export const AUDIT_FLOOR = 55;
 export const SCORE_CSV_HEADERS = [
-  "Full Name", "Job Title", "Job Section", "Headline", "Location",
+  "Full Name", "Job Title", "Job Section", "Headline", "Company", "Location",
   "ICP Search Score", "Qualification", "Job Title (65)", "Job Section/Headline (20)", "Location (15)",
-  "Qwen Review", "Note", "LinkedIn Url",
+  "Fit Verdict", "Decision Basis", "Qwen Review", "Note", "LinkedIn Url",
 ];
 
 /* ------------------------------------------------------------------ parsing */
@@ -74,11 +77,21 @@ export function jobTitleFromSection(jobSection, headline) {
   }
   return headlineParts(headline).title;
 }
-// Company segment of the current position ("chez X" / "at X") — used as domain
-// evidence: a firm literally named after the ICP's domain IS the domain.
-export function companyFromSection(jobSection) {
-  const m = String(jobSection || "").match(/(?:\schez\s|\sat\s|@)\s*(.+)$/i);
-  return m ? normText(m[1]) : "";
+// Employer name after a "chez X" / "at X" / "@ X" marker in a single text, trimmed at
+// the first descriptive separator. Used both as the Company column and as domain
+// evidence (a firm literally named after the ICP's domain IS the domain).
+export function companyByPreposition(text) {
+  const m = normText(text).match(/(?:\bchez\s+|\bat\s+|@\s*)(.+)$/i);
+  if (!m) return "";
+  const c = m[1].split(/\s[-–—|•·]\s|[|•·]| - /)[0];
+  return normText(c).replace(/[.,;:]+$/, "").slice(0, 80).trim();
+}
+// Company can appear in the Job Section, the Headline, or the Job Title — check all
+// three (section first, then headline, then title) so brands like "@ C2P Recrutement"
+// or "chez X" are captured wherever the person wrote them.
+export function extractCompany(jobTitle, jobSection, headline) {
+  for (const text of [jobSection, headline, jobTitle]) { const c = companyByPreposition(text); if (c) return c; }
+  return "";
 }
 // Build the descriptive fields used for scoring + CSV from one captured search row.
 export function rowFieldsFromCapture(data = {}) {
@@ -90,7 +103,7 @@ export function rowFieldsFromCapture(data = {}) {
     job_title,
     job_section,
     headline,
-    company: normText(data.company) || companyFromSection(job_section),
+    company: normText(data.company) || extractCompany(job_title, job_section, headline),
     location: normText(data.location),
     linkedin_url: canonicalProfileUrl(data.profile_url) || canonicalUrl(data.profile_url),
   };
@@ -171,15 +184,38 @@ export function expandIcpPrompt(icp) {
   const user = JSON.stringify({ job_titles: icp.job_titles, keywords: icp.keywords });
   return { system, user, max_tokens: 1800, temperature: 0, json: true };
 }
-// Qwen prompt: advisory review of one borderline prospect. The verdict goes in its own
-// CSV column and NEVER changes the numeric score (the LLM never assigns points).
+// Shared auditor instruction (generic — no industry hardcoded; adapts to any ICP).
+const AUDIT_SYSTEM = `You audit LinkedIn prospects against an Ideal Customer Profile (ICP). For each prospect decide whether they truly match the ICP, judging from ALL provided facts — especially the EMPLOYER/company type versus the ICP's target, and the role's real seniority and intent (not literal string membership in the title list). If the employer is not the ICP's target type (for example an internal/in-house function inside an organisation the ICP does not target), it is "no_fit" even when title words overlap. Past or aspirational roles ("ex", "former", "ancien", "aspiring", "futur") are "no_fit". Judge ONLY from the facts; never invent. This is advisory and does not change any numeric score.`;
+const prospectFacts = rf => ({ job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline, company: rf.company, location: rf.location });
+const icpFacts = icp => ({ job_titles: icp.job_titles, keywords: icp.keywords, locations: icp.locations });
+// Single-prospect audit.
 export function reviewPrompt(rf, icp) {
-  const system = `You audit one LinkedIn prospect against an ICP. Judge ONLY from the provided facts; never invent data. Output ONLY a JSON object: {"verdict":"fit|no_fit|uncertain","reason":"<max 12 words citing the decisive fact>"}. This is an advisory review; it does not change any score.`;
-  const user = JSON.stringify({
-    icp: { job_titles: icp.job_titles, keywords: icp.keywords, locations: icp.locations },
-    prospect: { job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline, location: rf.location },
-  });
-  return { system, user, max_tokens: 120, temperature: 0, json: true };
+  const system = `${AUDIT_SYSTEM} Output ONLY a JSON object: {"verdict":"fit|no_fit|uncertain","reason":"<=12 words citing the decisive fact"}.`;
+  return { system, user: JSON.stringify({ icp: icpFacts(icp), prospect: prospectFacts(rf) }), max_tokens: 120, temperature: 0, json: true };
+}
+// Batched audit of up to ~10 gray-zone prospects in one call (token-efficient).
+export function reviewBatchPrompt(prospects, icp) {
+  const system = `${AUDIT_SYSTEM} Output ONLY a JSON object: {"results":[{"i":<index from input>,"verdict":"fit|no_fit|uncertain","reason":"<=12 words citing the decisive fact"}]} — one entry per input prospect.`;
+  const user = JSON.stringify({ icp: icpFacts(icp), prospects: prospects.map((rf, i) => ({ i, ...prospectFacts(rf) })) });
+  return { system, user, max_tokens: Math.min(1600, 140 + 80 * prospects.length), temperature: 0, json: true };
+}
+// Gray-zone gate: audit only rows where the ICP-aware verdict could change the outcome —
+// score >= AUDIT_FLOOR, and NOT a clean high-confidence lexical qualification. Clean
+// qualified rows and clearly-low rows are decided deterministically at zero token cost.
+export function needsAudit(s) {
+  const num = Number(s && s.score);
+  if (!Number.isFinite(num)) return false;
+  if (num < AUDIT_FLOOR) return false;
+  if (!s.needs_review && !s.title_from_embeddings && num >= QUALIFICATION_THRESHOLD) return false;
+  return true;
+}
+// Two-factor qualification: when an audit verdict exists it decides; otherwise the score
+// threshold decides. The numeric score itself is never modified.
+export function decideQualification(score, verdict) {
+  if (verdict === "fit") return { qualification: "qualified", basis: "audit-fit" };
+  if (verdict === "no_fit" || verdict === "no fit") return { qualification: "unqualified", basis: "audit-nofit" };
+  const num = Number(score);
+  return { qualification: Number.isFinite(num) && num >= QUALIFICATION_THRESHOLD ? "qualified" : "unqualified", basis: "score" };
 }
 // Qwen prompt: resolve an unresolved displayed location against accepted geography.
 export function locationNormalizePrompt(displayed, accepted) {
@@ -407,9 +443,10 @@ export function buildScoreCsv(rows) {
   const lines = [SCORE_CSV_HEADERS.join(";")];
   for (const r of rows) {
     lines.push([
-      r.full_name, r.job_title, r.job_section, r.headline, r.location,
-      r.icp_score, qualification(r.icp_score), pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location),
-      r.qwen_review || "", r.note || "", r.linkedin_url,
+      r.full_name, r.job_title, r.job_section, r.headline, r.company || "", r.location,
+      r.icp_score, r.qualification || qualification(r.icp_score),
+      pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location),
+      r.fit_verdict || "", r.decision_basis || "score", r.qwen_review || "", r.note || "", r.linkedin_url,
     ].map(csvCell).join(";"));
   }
   return "﻿" + lines.join("\r\n"); // UTF-8 BOM (utf-8-sig parity)
