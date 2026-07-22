@@ -1,4 +1,4 @@
-# Local Lead URL Lens 1.6.0
+# Local Lead URL Lens 1.7.0
 
 A standalone Manifest V3 extension that **captures LinkedIn People Search / Sales Navigator prospects and scores them locally against your ICP, then downloads a CSV** — with **no backend and no CRM**. It is a separate extension from the CRM-connected *Lead URL Lens*; nothing here talks to `lead-url-lens-crm…chatgpt.site`.
 
@@ -56,6 +56,17 @@ All rules derive from the ICP's accepted values — nothing is hardcoded to a sp
 
 A **Company** column, parsed from the Job Section, Headline, **and** Job Title (via `chez` / `at` / `@`). This also fixes profiles whose firm name lives only in the headline (e.g. "Directrice … @ C2P Recrutement"): the company-name domain evidence now fires and the row scores correctly.
 
+### v1.7.0 — ICP Match phase (remaining ICP fields, qualified prospects only)
+
+The ICP Search Score covers job title, headline keywords, and location. The rest of the ICP — **Industry**, **Company Headcount**, and the **compound AND-keyword groups** — lives on the profile and company pages. After capture+scoring, a second durable phase visits each **qualified** prospect and computes **ICP Match** (TRUE/FALSE):
+
+- **Deep profile visit:** expands every truncated block ("…voir plus" / "see more" detected and clicked until none remain), reads the full **Infos/About** text, the latest experience (expanded), and the current-company link.
+- **Company "À propos" visit:** reads **Secteur** (industry), **Taille de l'entreprise** (headcount range) and the expanded description. **Cached per company** across prospects and runs — shared employers cost one visit.
+- **Deterministic evaluation per compiled ICP:** title ∈ that ICP's list (lexical matcher) ∧ tolerant industry match (LinkedIn labels ≠ ICP wording — token match first, one cached Qwen category-membership call as fallback) ∧ headcount range-intersects the ICP band ∧ every AND-keyword group present across headline+About+company description. `ICP Match = TRUE` if **any** ICP fully passes; `Matched ICP` names it; `ICP Match Details` lists the failing fields otherwise. No LLM computes the boolean.
+- **Company-unavailable fallback chain:** (1) company URL searched in the **latest experience description**; (2) failing that, the **latest post/comment age** decides — activity **< 7 days** ⇒ `ICP Match TRUE` (noted `company_unavailable_recent_activity`), else `FALSE` (`…stale_activity` / `…no_activity`).
+- The whole ICP document is compiled once (cached) into per-ICP structures — one or many ICPs, any industry; fields an ICP omits are skipped. Unqualified prospects are never visited (`ICP Match` blank).
+- New CSV columns: **Company Industry, Company Headcount, ICP Match, Matched ICP, ICP Match Details** (18 columns total). Phase is pause/cancel/checkpoint-safe and resumable.
+
 ### v1.6.0 — Qualification is score-only again
 
 The optional ICP-aware Qwen **fit audit** that could override Qualification (introduced in v1.5.0) has been **removed**. `Qualification` now depends **only** on the numeric score — `qualified` when score ≥ 75, else `unqualified` — so a 100 is always `qualified`. No fit audit runs, so there are **no per-prospect Qwen review calls** (Qwen is still used only for ICP prose compile + location normalization). The `Fit Verdict`, `Decision Basis`, and `Qwen Review` columns are removed.
@@ -92,10 +103,10 @@ Paste text, choose a file, or set a raw URL. Either:
 `local-lead-icp-scores.csv` — UTF-8, **semicolon-delimited**, columns:
 
 ```
-Full Name;Job Title;Job Section;Headline;Company;Location;ICP Search Score;Qualification;Job Title (65);Job Section/Headline (20);Location (15);Note;LinkedIn Url
+Full Name;Job Title;Job Section;Headline;Company;Company Industry;Company Headcount;Location;ICP Search Score;Qualification;ICP Match;Matched ICP;ICP Match Details;Job Title (65);Job Section/Headline (20);Location (15);Note;LinkedIn Url
 ```
 
-`ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; `Qualification` is `qualified` (score ≥ 75) or `unqualified`; `Company` is the parsed employer; the three component columns show each sub-match as a percentage; `Note` explains flags (`cross_field_title_match`, `private_or_empty_profile`, `embeddings_unavailable`). One row per distinct prospect (canonical-URL deduplicated).
+`ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; `Qualification` is `qualified` (score ≥ 75) or `unqualified`; `ICP Match` is TRUE/FALSE for qualified prospects (blank = not evaluated); `Matched ICP` names the passing ICP; `ICP Match Details` lists failing fields or the fallback used; the three component columns show each sub-match as a percentage; `Note` explains flags. One row per distinct prospect (canonical-URL deduplicated).
 
 ## Install (recommended: git clone — updates without re-downloading zips)
 

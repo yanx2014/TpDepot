@@ -37,4 +37,45 @@
   async function activity(type="post",limit=7){if(blocked())return{blocked:true,error_code:"linkedin_checkpoint"};const selector="article, div.feed-shared-update-v2, li.profile-creator-shared-feed-update__container";for(let attempt=0;attempt<24;attempt++){if(blocked())return{blocked:true,error_code:"linkedin_checkpoint"};const count=document.querySelectorAll(selector).length;if(count>=limit)break;if(attempt%3===0)window.scrollBy({top:Math.max(520,Math.round(innerHeight*.75)),behavior:"instant"});await sleep(240)}const business=/recrut|hiring|client|croissance|growth|lancement|launch|partenariat|partner|équipe|team|vente|sales|rh|business|expansion|funding|levée|nouveau|new role|mission/i,seen=new Set();return[...document.querySelectorAll(selector)].map((item,index)=>{const content=(item.innerText||"").replace(/\s+/g," ").trim().slice(0,5000),anchor=item.querySelector('a[href*="/posts/"],a[href*="/feed/update/"],a[href*="/comments/"]'),activityUrl=anchor?.href||`${location.href}#activity-${index+1}`,key=activityUrl.replace(/[?#].*$/,"");if(!content||seen.has(key))return null;seen.add(key);const useful=business.test(content),time=item.querySelector("time")?.dateTime||item.querySelector("time")?.textContent||"",parent=type==="comment"?(item.querySelector(".update-components-update-v2__commentary,.feed-shared-update-v2__description")?.textContent||"").trim().slice(0,1000):"";return{source_evidence_id:`${type}_${index+1}`,activity_type:type,content,published_at:time,activity_url:activityUrl,parent_post_excerpt:parent,author_or_page:"",topics:[],mentioned_tools:[],mentioned_companies:[],business_signal:useful?content.slice(0,260):"",interest_signal:content.slice(0,260),useful,signal:useful?content.slice(0,260):"",collected_at:now()}}).filter(Boolean).slice(0,limit)}
   chrome.runtime.onMessage.addListener((message,_sender,send)=>{if(message.type==="CAPTURE_PROFILE"){profile().then(send).catch(error=>send({blocked:true,error_code:"profile_capture_failed",error_message:error.message}));return true}if(message.type==="CAPTURE_COMPANY"){company().then(send).catch(error=>send({blocked:true,error_code:"company_capture_failed",error_message:error.message}));return true}if(message.type==="RESOLVE_FROM_SEARCH")send(resolveFromSearch(message));if(message.type==="CAPTURE_ACTIVITY"){activity(message.activity_type||"post",Math.min(12,Math.max(1,Number(message.limit)||7))).then(send).catch(error=>send({blocked:true,error_code:"activity_capture_failed",error_message:error.message}));return true}if(message.type==="CAPTURE_POSTS"){activity("post",7).then(send).catch(error=>send({blocked:true,error_code:"posts_capture_failed",error_message:error.message}));return true}if(message.type==="CRM_FETCH"){fetch(message.url,{...message.options,credentials:"include"}).then(async response=>send({ok:response.ok,status:response.status,data:await response.json()})).catch(error=>send({ok:false,status:0,data:{error:error.message}}));return true}return false});
   if(location.hostname.includes("lead-url-lens-crm")&&location.hash.startsWith("#pair=")){const token=decodeURIComponent(location.hash.slice(6));chrome.storage.local.set({crm:location.origin,token});history.replaceState(null,"",location.pathname)}
+  /* ---- Local Lead URL Lens deep capture (ICP Match phase). New handlers only; the
+     capture logic above is untouched. Truncated text ("…voir plus" / "see more") is
+     detected via its expand buttons and clicked until none remain, so full text is
+     captured before analysis. ---- */
+  async function expandAllTruncated(root){
+    const scope=root||document.querySelector("main")||document.body;
+    for(let round=0;round<4;round++){
+      const buttons=[...scope.querySelectorAll("button, a[role='button']")].filter(el=>visible(el)&&/(voir plus|voir la suite|afficher plus|see more|show more|…\s*plus)/i.test(((el.innerText||"")+" "+(el.getAttribute("aria-label")||""))));
+      if(!buttons.length)break;
+      for(const b of buttons){try{b.click()}catch{}}
+      await sleep(380);
+    }
+  }
+  function aboutSectionNode(){
+    const marker=document.querySelector("main #about,main [id*='about' i]");
+    if(marker){const s=marker.closest("section")||marker.parentElement?.parentElement;if(s)return s}
+    for(const h of document.querySelectorAll("main h2,main [role='heading'],main span[aria-hidden='true']")){if(/^(infos|about|a propos)$/.test(normalized(h.textContent))){const s=h.closest("section")||h.closest(".artdeco-card");if(s)return s}}
+    return null;
+  }
+  async function profileDeep(){
+    if(blocked())return{blocked:true,error_code:"linkedin_checkpoint"};
+    if(!location.pathname.startsWith("/in/"))return{blocked:true,error_code:"unsupported_page"};
+    await expandAllTruncated();
+    const about=aboutSectionNode();
+    if(about){about.scrollIntoView({block:"center"});await sleep(250);await expandAllTruncated(about)}
+    const about_text=about?lines(about).filter(l=>!/^(infos|about|à propos)$/i.test(l)&&!/(voir plus|see more|voir moins|see less)/i.test(l)).join(" ").slice(0,6000):"";
+    const expSection=await findExperienceSection();
+    let latest_experience_text="",company_profile_url="",company_url_from_description="";
+    if(expSection){expSection.scrollIntoView({block:"center"});await sleep(250);await expandAllTruncated(expSection);
+      const items=meaningfulItems(expSection),latest=items[0];
+      if(latest){latest_experience_text=(latest.innerText||"").replace(/\s+/g," ").trim().slice(0,4000);
+        const anchor=latest.querySelector('a[href*="/company/"]');if(anchor)company_profile_url=contract.canonicalCompanyUrl(anchor.href||"");
+        const m=latest_experience_text.match(/https?:\/\/(?:www\.)?linkedin\.com\/company\/[\w%.-]+/i);if(m)company_url_from_description=m[0].replace(/[.,;]+$/,"")}}
+    if(!company_profile_url){const top=document.querySelector('main a[href*="/company/"]');if(top)company_profile_url=contract.canonicalCompanyUrl(top.href||"")}
+    return{about_text,latest_experience_text,company_profile_url,company_url_from_description,collected_at:now()};
+  }
+  chrome.runtime.onMessage.addListener((message,_sender,send)=>{
+    if(message.type==="CAPTURE_PROFILE_DEEP"){profileDeep().then(send).catch(error=>send({blocked:true,error_code:"deep_capture_failed",error_message:error.message}));return true}
+    if(message.type==="CAPTURE_COMPANY_DEEP"){(async()=>{await expandAllTruncated();return company()})().then(send).catch(error=>send({blocked:true,error_code:"company_capture_failed",error_message:error.message}));return true}
+    return false;
+  });
 })();

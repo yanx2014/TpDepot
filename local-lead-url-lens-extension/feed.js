@@ -23,8 +23,9 @@ export const CALIBRATION = { floor: 0.35, ceil: 0.80 };
 // NOT COMPUTED) → "unqualified". No verdict override.
 export const QUALIFICATION_THRESHOLD = 75;
 export const SCORE_CSV_HEADERS = [
-  "Full Name", "Job Title", "Job Section", "Headline", "Company", "Location",
-  "ICP Search Score", "Qualification", "Job Title (65)", "Job Section/Headline (20)", "Location (15)",
+  "Full Name", "Job Title", "Job Section", "Headline", "Company", "Company Industry", "Company Headcount", "Location",
+  "ICP Search Score", "Qualification", "ICP Match", "Matched ICP", "ICP Match Details",
+  "Job Title (65)", "Job Section/Headline (20)", "Location (15)",
   "Note", "LinkedIn Url",
 ];
 
@@ -180,6 +181,89 @@ export function expandIcpPrompt(icp) {
   const system = `You expand accepted ICP values for lead scoring, in any industry. For each accepted job title and keyword, generate close variants a matching profile might display instead: common synonyms, standard abbreviations (e.g. "VP" / "Vice President"), and translations between the ICP's languages (at minimum French and English). For every role word in a gendered language ALWAYS include all gender forms (Fondateur AND Fondatrice, Directeur AND Directrice) and common plurals. For role-plus-domain titles, include BOTH the short role form and the role-plus-domain form. Include owner-operator equivalents ("Chef d'entreprise", "Dirigeant", "Gérant", "Président", "CEO", "Directeur Général") ONLY when they are strictly equivalent to an accepted role's seniority and function (e.g. the ICP targets founders/owners). As keyword_variants, also include the essential single-token domain words extracted from the accepted values (e.g. the domain noun of a role-plus-domain phrase). Never broaden to a different role, a different industry, or a more junior/senior level. Output ONLY a JSON object: {"job_title_variants":["…"],"keyword_variants":["…"]} containing ONLY the new variants (not the originals).`;
   const user = JSON.stringify({ job_titles: icp.job_titles, keywords: icp.keywords });
   return { system, user, max_tokens: 1800, temperature: 0, json: true };
+}
+/* ------------------------- Full ICP (remaining fields) → ICP Match ------------------------- */
+// Compile the WHOLE ICP document into per-ICP structures for the remaining fields the
+// search score does not cover (industry, headcount band, compound AND-keyword groups).
+// Generic: works for one or many ICPs of any industry; fields an ICP omits are skipped.
+export function compileFullIcpPrompt(icpText) {
+  const system = `You convert an Ideal Customer Profile (ICP) document into a strict JSON schema for deterministic matching. The document may define ONE or MORE ICPs. Extract ONLY what the document states; never invent. Output ONLY JSON:
+{"icps":[{"name":"<short name>","job_titles":["…"],"industries":["…"],"headcount_min":<int|null>,"headcount_max":<int|null>,"keyword_groups":[["…"],["…"]],"locations":["…"]}]}
+Rules: a headcount like "11-50 employés" → headcount_min 11, headcount_max 50. keyword_groups: each AND-group of the ICP's keyword expression becomes one array of its OR-alternatives (e.g. (A OR B) AND (C OR D) → [[A,B],[C,D]]). Use [] or null for fields an ICP does not define.`;
+  return { system, user: `ICP document:\n${icpText}`, max_tokens: 1800, temperature: 0, json: true };
+}
+// Parse a LinkedIn headcount text ("11-50 employés", "0-1 employés", "10 000+ employés").
+export function parseHeadcountRange(text) {
+  const t = fold(text);
+  const num = s => parseInt(String(s).replace(/[^\d]/g, ""), 10);
+  let m = t.match(/(\d[\d\s.,]*)\s*[-–à]\s*(\d[\d\s.,]*)/);
+  if (m) return { min: num(m[1]), max: num(m[2]) };
+  m = t.match(/(\d[\d\s.,]*)\s*\+/);
+  if (m) return { min: num(m[1]), max: null };
+  m = t.match(/(\d[\d\s.,]*)\s*(?:employe|salarie|membre)/);
+  if (m) return { min: num(m[1]), max: num(m[1]) };
+  return null;
+}
+export function headcountOverlaps(range, min, max) {
+  if (!range) return null;
+  const lo = range.min ?? 0, hi = range.max ?? Infinity;
+  return hi >= (min ?? 0) && lo <= (max ?? Infinity);
+}
+// Tolerant industry match: LinkedIn's Secteur labels rarely equal ICP wording
+// ("Recrutement et placement de personnel" vs "Recrutement et intérim"), so match on
+// shared significant tokens; null = unresolved (caller may normalize via cached Qwen).
+export function industryTokensMatch(pageIndustry, accepted) {
+  const pt = new Set(contentTokens(pageIndustry));
+  if (!pt.size) return null;
+  for (const a of accepted) for (const t of contentTokens(a)) if (t.length > 3 && pt.has(t)) return true;
+  return null;
+}
+// Compound keyword rule: every AND-group must have >=1 OR-alternative lexically present.
+export function keywordGroupsOk(textBlob, groups) {
+  if (!Array.isArray(groups) || !groups.length) return true;
+  return groups.every(g => (Array.isArray(g) && g.length) ? lexicalMatch(textBlob, g) : true);
+}
+// Parse LinkedIn relative timestamps ("3 j", "5 h", "1 sem.", "2 semaines", "3d", "1w",
+// "2 mois") into age in days; null when unparseable.
+export function parseRelativeAgeDays(text) {
+  const t = fold(text);
+  const m = t.match(/(\d+)\s*(min|h\b|heure|j\b|jour|d\b|day|sem|w\b|week|mois|mo\b|month|an\b|y\b|year)/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10), u = m[2];
+  if (/^min/.test(u)) return n / 1440;
+  if (/^h/.test(u)) return n / 24;
+  if (/^(j|jour|d|day)/.test(u)) return n;
+  if (/^(sem|w|week)/.test(u)) return n * 7;
+  if (/^(mois|mo|month)/.test(u)) return n * 30;
+  return n * 365;
+}
+// Evaluate the remaining ICP fields for one qualified prospect against every compiled
+// ICP. Deterministic; industryOkByIcp[i] (true/false/null) carries any cached Qwen
+// industry normalization the caller resolved. TRUE when at least one ICP fully passes.
+export function evaluateIcpMatch({ rf, aboutText = "", companyIndustry = "", companyHeadcountText = "", companyDescription = "", industryOkByIcp = [] }, fullIcp) {
+  const icps = (fullIcp && fullIcp.icps) || [];
+  if (!icps.length) return { match: "", matched_icp: "", details: "no_full_icp" };
+  const blob = normText([rf.job_title, rf.job_section, rf.headline, rf.company, aboutText, companyDescription].join(" "));
+  const range = parseHeadcountRange(companyHeadcountText);
+  const failsAll = [];
+  for (const [i, icp] of icps.entries()) {
+    const fails = [];
+    const titles = (icp.job_titles || []).map(normText).filter(Boolean);
+    if (titles.length && !titleLexicalEvidence(rf, titles, { specific: new Set() }).hit) fails.push("title");
+    const inds = (icp.industries || []).map(normText).filter(Boolean);
+    if (inds.length) {
+      const ok = industryOkByIcp[i] === true || industryTokensMatch(companyIndustry, inds) === true;
+      if (!ok) fails.push(companyIndustry ? "industry" : "industry_unknown");
+    }
+    if (icp.headcount_min != null || icp.headcount_max != null) {
+      const ok = headcountOverlaps(range, icp.headcount_min, icp.headcount_max);
+      if (ok !== true) fails.push(range ? `headcount:${normText(companyHeadcountText)}` : "headcount_unknown");
+    }
+    if (!keywordGroupsOk(blob, icp.keyword_groups)) fails.push("keywords");
+    if (!fails.length) return { match: "TRUE", matched_icp: icp.name || `ICP ${i + 1}`, details: "" };
+    failsAll.push(`${icp.name || `ICP ${i + 1}`}: ${fails.join(",")}`);
+  }
+  return { match: "FALSE", matched_icp: "", details: failsAll.join(" | ") };
 }
 // Qwen prompt: resolve an unresolved displayed location against accepted geography.
 export function locationNormalizePrompt(displayed, accepted) {
@@ -407,8 +491,8 @@ export function buildScoreCsv(rows) {
   const lines = [SCORE_CSV_HEADERS.join(";")];
   for (const r of rows) {
     lines.push([
-      r.full_name, r.job_title, r.job_section, r.headline, r.company || "", r.location,
-      r.icp_score, qualification(r.icp_score),
+      r.full_name, r.job_title, r.job_section, r.headline, r.company || "", r.company_industry || "", r.company_headcount || "", r.location,
+      r.icp_score, qualification(r.icp_score), r.icp_match || "", r.matched_icp || "", r.icp_match_details || "",
       pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location),
       r.note || "", r.linkedin_url,
     ].map(csvCell).join(";"));
