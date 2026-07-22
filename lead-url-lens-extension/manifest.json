@@ -1,18 +1,12 @@
 {
   "manifest_version": 3,
   "name": "TechNFirms Lead URL Lens",
-  "version": "18.0.0",
-  "description": "Capture LinkedIn search results, run durable one-contact-leased enrichment, and run the Feed workflow: generalized ICP scoring (OpenAI embeddings + deterministic rules) with keys from a local encrypted vault or the connected CRM proxy, exported as a semicolon CSV.",
+  "version": "25.5.1",
+  "description": "Capture LinkedIn pages in bounded 10-prospect transactions for fast backend-authoritative 65/20/15 ICP scoring with cached Qwen teacher review and student learning.",
   "permissions": ["activeTab", "tabs", "storage", "scripting", "downloads", "alarms"],
   "host_permissions": [
     "https://www.linkedin.com/*",
-    "https://lead-url-lens-crm.yann-brou222.chatgpt.site/*",
-    "https://api.anthropic.com/*",
-    "https://api.openai.com/*",
-    "https://dashscope-intl.aliyuncs.com/*",
-    "https://dashscope.aliyuncs.com/*",
-    "https://raw.githubusercontent.com/*",
-    "https://gist.githubusercontent.com/*"
+    "https://lead-url-lens-crm.yann-brou222.chatgpt.site/*"
   ],
   "icons": {
     "16": "icons/icon-16.png",

@@ -1,4 +1,20 @@
-# TechNFirms Lead URL Lens 11.0.0
+# TechNFirms Lead URL Lens 25.5.0
+
+## CRM-backed Offer + ICP scoring
+
+The Feed tab and browser-side API-key vault are removed. Configure OpenAI embeddings and Qwen in the CRM, then upload ICP Markdown and Offer Markdown under **Offers & ICP**. Every Offer is associated with an immutable ICP version.
+
+Lead collection now selects an Offer and uses the existing capture/import action. Every acknowledged import page automatically triggers backend scoring against the Offer's associated ICP. A failed or incomplete scoring run stops the extension with an explicit error after preserving the imported contacts; it never reports a successful score or invents a value. Provider credentials never enter extension storage or browser requests.
+
+ICP Search Score is calculated only by the CRM with the fixed, auditable contract: Job Title 65 + Job Section/Headline 20 + Location 15. Company, company type, industry, website and every other field are excluded from this score and cannot block it. Rules and multilingual embeddings provide the first signals; the approved professional-role student handles validated patterns; Qwen 3.7 Plus reviews cases that are not reliably resolved and its audited decisions become versioned teacher examples for future student training. Unresolved material evidence or a blocking consistency audit produces `NOT COMPUTED`—never a misleading qualification. The extension never assigns points or bypasses the audit.
+
+The authenticated CRM proxy contract is:
+
+- `POST /api/extension/embed` → `{ "vectors": [[...]] }`
+- `POST /api/extension/chat` → `{ "content": "..." }`
+- `GET /api/extension/scoring-context` → saved Offers and ICP versions
+
+Each request uses `Authorization: Bearer <pairing-token>`.
 
 The extension now runs as a draggable TechNFirms launcher directly on supported LinkedIn pages. Click the square launcher to open the full-height left/right panel; drag it to another edge or minimize it at any time.
 
@@ -6,7 +22,7 @@ Lead collection requires an intentional import-list name or an existing CRM list
 
 Standard LinkedIn People Search capture starts on the page the user opened and follows the rendered Next control through as many result pages as necessary. There is no fixed page limit: the requested number of new CRM contacts controls the run, with an absolute target maximum of 500. Repeated or temporarily empty pages trigger bounded reload and reinjection recovery. The open panel, form values, progress, processed pages, and acknowledged canonical profile history survive navigation and service-worker restarts. Changing to another browser tab does not interrupt capture. The run stops when the requested new-contact target is reached, LinkedIn exposes no next page, the user pauses/cancels, or a LinkedIn security checkpoint appears.
 
-The extension resolves profile anchors from both result-card containers and the anchors themselves, checks every page against the CRM, and transfers the visible name, headline, company, location, profile photo, company link/logo when exposed, canonical profile URL, source page/search, preview, and timestamp. The CRM acknowledges each processed page before navigation, applies global canonical-URL deduplication, and counts only newly created contacts toward the target.
+The extension resolves profile anchors from both result-card containers and the anchors themselves, checks every page against the CRM, and transfers the visible name, Headline, complete Current position Job Section, location, company, profile photo, company link/logo when exposed, canonical profile URL, source page/search, preview, and timestamp. Headline and Job Section are preserved independently; scoring uses both fields, and Job Section contains only the complete visible Poste actuel or Current position text. The CRM acknowledges each processed page before navigation, applies global canonical-URL deduplication, and counts only newly created contacts toward the target.
 
 One Manifest V3 extension for two user-initiated workflows:
 
@@ -22,67 +38,3 @@ One Manifest V3 extension for two user-initiated workflows:
 5. Create a pairing token in the CRM and enter it once in the extension.
 
 The token is verified before use and is hidden after connection. Collection uses only the visible authenticated tab, stops at LinkedIn checkpoints, and never exports cookies or calls undocumented LinkedIn APIs.
-
-
-## Feed workflow — ICP scoring
-
-The **Feed** tab scores a list of LinkedIn profiles against a user-defined ICP and exports a CSV. It implements the generalized `icp-scoring` skill (`icp-scoring-skill/` in this repo): OpenAI embeddings + deterministic rules in code; the LLM never computes the score.
-
-### API keys source
-
-The **API keys source** selector (top of the Feed tab) chooses where the OpenAI (embeddings) and Qwen (compile/location) calls get their keys:
-
-- **CRM proxy** — the extension sends every embedding and Qwen request to the connected CRM, which holds the API keys **server-side** and forwards them to OpenAI / Qwen. **No API keys are ever stored in or transit the browser.** This is the recommended option. Press **Verify CRM proxy** to confirm the CRM implements the two endpoints. Requires only that the CRM be connected (pairing token) — the passphrase vault below is not used.
-- **Local encrypted vault** — the extension calls OpenAI / DashScope directly using keys you store in the passphrase-gated vault (below). Use this if the CRM does not proxy LLM calls.
-
-#### CRM proxy contract
-
-For the CRM-proxy option the CRM at `lead-url-lens-crm.yann-brou222.chatgpt.site` must expose two authenticated endpoints (same Bearer pairing token + `credentials: include` as the other `/api/extension/*` routes):
-
-- `POST /api/extension/embed` — body `{ "model": "text-embedding-3-small", "input": ["…", "…"] }` → `{ "vectors": [[…], […]] }` (the extension also accepts an OpenAI-shaped `{ "data": [{ "embedding": [...] }] }` or `{ "embeddings": [...] }`). The CRM forwards to OpenAI with its own key.
-- `POST /api/extension/chat` — body `{ "provider": "qwen", "model": "qwen3.7-plus", "region": "intl|cn", "system": "…", "user": "…", "max_tokens": N, "temperature": 0, "json": true }` → `{ "content": "…" }` (also accepts `{ "text": "…" }` or an OpenAI-shaped `{ "choices": [{ "message": { "content": "…" } }] }`). The CRM forwards to Qwen/DashScope (or any model it maps `provider` to) with its own key.
-
-The extension never sees the keys in this mode; the CRM is responsible for holding them and enforcing its own rate limits.
-
-### Passphrase-gated key vault (local vault option only)
-
-Keys are protected by a **passphrase you enter once per browser session** — never stored. It derives an AES-256 key via **PBKDF2** (210k iterations, SHA-256) that encrypts your API keys (AES-GCM) at rest. **Unlock** each session (the derived key lives only in `chrome.storage.session`, so it survives service-worker restarts but clears when the browser closes); **Lock** clears it now; **Change** re-encrypts under a new passphrase. Keys can only be set/used while unlocked.
-
-### Keys
-
-- **OpenAI API key — embeddings.** Used exclusively for `text-embedding-3-small` (the skill mandates it; never substituted). Required.
-- **Qwen API key — ICP compile + location normalization.** Compiles the `icps.md` prose into the scoring schema (one cached call) and normalizes unresolved locations. Model configurable (default `qwen3.7-plus`), with a **DashScope region** toggle (International / China). Optional if you paste a structured ICP JSON and all locations resolve exactly.
-
-Both keys are write-only in the UI: press **Save & verify** to store encrypted + run a live connection test (🔒 *Configured & connection verified*); the field then shows only `••••••••`.
-
-### Inputs
-
-- **Profiles file** — `LINKS_TO_ANALYZE.md`: local file or raw URL; every `linkedin.com/in/…` or `/sales/lead/…` URL is scored, de-duplicated (up to 1000).
-- **ICP definition** — `icps.md`: prose/Markdown (auto-compiled to the schema via Qwen) or a structured ICP JSON per `icp-scoring-skill/references/icp-schema.md`.
-
-### Scoring (deterministic, in code)
-
-Criteria and default weights: **job_titles 60 / locations 25 / keywords 15**, normalized to 100.
-- **job_titles** — max cosine(profile payload, each accepted title) via OpenAI embeddings. Payload = Job Section + Headline.
-- **keywords** — lexical match first (phrase / whole-token / synonyms, stopwords rejected, `minimum_matches` / `match_mode`); embeddings only as fallback.
-- **locations** — exact/containment against accepted values → 1.0; else one cached Qwen normalization call → 1.0 / 0.5 (partial) / 0.
-- If embeddings can't run for a profile → score = `NOT COMPUTED` (never estimated by an LLM).
-
-### Output
-
-`icp-scores.csv` — UTF-8, **semicolon-delimited**, columns exactly:
-
-```
-Full Name;Job Section;Headline;Location;ICP Search Score;LinkedIn Url
-```
-
-Score is an integer 0–100 or `NOT COMPUTED`. One row per distinct result, canonical-URL deduplicated. **Download CSV** re-exports (including partial results after pause/cancel). The run is durable (survives service-worker restarts), pauses on LinkedIn checkpoints, and closes its worker tab when finished.
-
-> Persona-card and outreach generation are **not** part of this workflow — the Feed is now pure ICP scoring per the new skill.
-
-## Install (Feed / dev)
-
-1. Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, select the `lead-url-lens-extension` folder.
-2. In the Feed tab, pick an **API keys source**:
-   - **CRM proxy:** connect the CRM (pairing token) → **Verify CRM proxy** → choose the profiles + ICP files → **Run ICP scoring**.
-   - **Local encrypted vault:** set a vault passphrase → **Unlock** → **Save & verify** the OpenAI key (and Qwen key) → choose the profiles + ICP files → **Run ICP scoring**.

@@ -91,12 +91,17 @@
     const headlineSelectors = ["[data-anonymize='headline']", ".entity-result__primary-subtitle", ".artdeco-entity-lockup__subtitle", "[data-field='headline']", "[class*='entity-result__primary-subtitle']"];
     const headlineNode=headlineSelectors.map(selector => card.querySelector(selector)).find(visible);
     const headline = clean(headlineNode?.textContent || all.find((line, position) => position > 0 && !relationshipNoise(line) && personName(line).toLocaleLowerCase()!==full_name.toLocaleLowerCase() && !/^(message|se connecter|connect|suivre|follow)$/i.test(line)) || "");
-    const locationText = clean(card.querySelector("[data-anonymize='location'], .entity-result__secondary-subtitle, .artdeco-entity-lockup__caption")?.textContent || all.find(line => /france|paris|lyon|london|belgique|suisse|remote|région|area/i.test(line)) || "");
-    const currentLine = all.find(line => /poste actuel|current position| chez | at /i.test(line)) || "";
-    const companyFromHeadline = headline.match(/(?:\s+chez\s+|\s+at\s+|\s+@)([^|·•]+)/i)?.[1] || "";
-    const company = clean(card.querySelector("[data-anonymize='company-name']")?.textContent || companyFromHeadline || currentLine.replace(/^.*?(?:chez|at)\s+/i, "").split(/[·•]/)[0]);
+    const locationSelectors=["[data-anonymize='location']","[data-field='location']",".entity-result__secondary-subtitle",".artdeco-entity-lockup__caption","[class*='entity-result__secondary-subtitle']"];
+    const locationNode=locationSelectors.map(selector=>card.querySelector(selector)).find(node=>visible(node)&&clean(node.textContent)!==headline);
+    const currentMarker=all.findIndex(line=>/^(poste actuel|current position|current role)\s*:/i.test(line));
+    const headlineIndex=all.findIndex(line=>clean(line)===headline),fallbackLocation=all.find((line,index)=>index>headlineIndex&&(currentMarker<0||index<currentMarker)&&clean(line)!==headline&&!relationshipNoise(line)&&!/^(message|se connecter|connect|suivre|follow|poste actuel|current position|current role)/i.test(line));
+    const locationText = clean(locationNode?.textContent || fallbackLocation || "");
+    const currentNode=card.querySelector("[data-field='current-position'], [data-anonymize='current-position']"),currentNodeText=clean(visible(currentNode)?currentNode.textContent:""),nextSection=currentMarker<0?-1:all.findIndex((line,index)=>index>currentMarker&&/^(postes? précédents?|previous positions?|récapitulatif|summary|formation|education)\s*:/i.test(line)),currentSection=clean(currentMarker<0?"":/^(poste actuel|current position|current role)\s*:\s*$/i.test(all[currentMarker])?all.slice(currentMarker,nextSection<0?all.length:nextSection).filter(line=>!/^(message|se connecter|connect|suivre|follow)$/i.test(line)).join(" "):all[currentMarker]),currentLine=currentNodeText.length>currentSection.length?currentNodeText:currentSection;
+    const jobSection=/^(poste actuel|current position|current role)\s*:/i.test(currentLine)?currentLine:"";
+    const companyFromJobSection = jobSection.match(/(?:\s+chez\s+|\s+at\s+|\s+@)([^|·•-]+)/i)?.[1] || "";
+    const company = clean(card.querySelector("[data-anonymize='company-name']")?.textContent || companyFromJobSection);
     const companyAnchor=card.querySelector('a[href*="/company/"]'),companyImage=companyAnchor?.querySelector("img");
-    return {capture_index:index+1,source_page:Number(new URL(location.href).searchParams.get("page"))||1,full_name,headline,company,location:locationText,profile_url,source_profile_url:profileAnchorNode?.href||"",profile_photo_url:imageUrl(card.querySelector("img")),company_profile_url:companyAnchor?.href||"",company_logo_url:imageUrl(companyImage),profile_preview:headline,source_search:location.href,collected_at:new Date().toISOString()};
+    return {capture_index:index+1,source_page:Number(new URL(location.href).searchParams.get("page"))||1,full_name,headline,job_section:jobSection,company,location:locationText,profile_url,source_profile_url:profileAnchorNode?.href||"",profile_photo_url:imageUrl(card.querySelector("img")),company_profile_url:companyAnchor?.href||"",company_logo_url:imageUrl(companyImage),profile_preview:[headline,jobSection].filter(Boolean).join(" · "),source_search:location.href,collected_at:new Date().toISOString()};
   }
   function pageState() { const selected=adapter(),cards=selected?.cards()||[],urls=cards.map(card=>canonical(profileAnchor(card)?.href||"")).filter(Boolean).sort();return{ready:Boolean(selected&&(urls.length||cards.length)),page_fingerprint:urls.join("|"),result_count:urls.length,page:Number(new URL(location.href).searchParams.get("page"))||1,has_next:Boolean(selected?.nextButton())}; }
   async function capture() {
@@ -105,7 +110,7 @@
     await scrollUntilStable();
     const rows=selected.cards().map(extract),captured=rows.filter(row=>row.profile_url),incomplete=rows.filter(row=>!row.profile_url||!row.full_name);
     const urls=rows.map(row=>row.profile_url).filter(Boolean).sort(),page_fingerprint=urls.join("|")||clean(document.querySelector("main")?.textContent).slice(0,500);
-    const valid_previews=rows.filter(row=>row.profile_preview).length,missing_urls=rows.filter(row=>!row.profile_url).length,duplicate_cards=rows.length-new Set(rows.map(row=>row.profile_url).filter(Boolean)).size-missing_urls;
+    const valid_previews=rows.filter(row=>row.headline||row.job_section).length,missing_urls=rows.filter(row=>!row.profile_url).length,duplicate_cards=rows.length-new Set(rows.map(row=>row.profile_url).filter(Boolean)).size-missing_urls;
     return{source_search:location.href,page_fingerprint,rows,valid_previews,missing_urls,duplicate_cards:Math.max(0,duplicate_cards),has_next:Boolean(selected.nextButton()),captured:captured,incomplete:incomplete};
   }
   async function nextPage(){const selected=adapter(),button=selected?.nextButton();if(!button)return{advanced:false,reason:"sales_results_complete"};button.click();return{advanced:true};}
