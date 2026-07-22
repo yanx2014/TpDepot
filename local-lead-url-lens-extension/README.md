@@ -81,9 +81,20 @@ Full Name;Job Title;Job Section;Headline;Location;ICP Search Score;Job Title (65
 
 `ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; the three component columns show each sub-match as a percentage. `Qwen Review` holds the advisory verdict for borderline (40–70) scores when a Qwen key is set; `Note` explains `NOT COMPUTED` rows (`private_or_empty_profile`, `embeddings_unavailable`). One row per distinct prospect (canonical-URL deduplicated).
 
-## Install
+## Install (recommended: git clone — updates without re-downloading zips)
 
-1. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the `local-lead-url-lens-extension` folder.
+1. Once, on your PC (requires [git](https://git-scm.com/download/win)):
+   ```
+   git clone https://github.com/yanx2014/TpDepot.git
+   cd TpDepot
+   git checkout claude/claude-chrome-chat-w2pjhz
+   ```
+2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `TpDepot\local-lead-url-lens-extension`.
+3. **To update later:** double-click `update-extension.bat` at the repo root (it runs `git pull` and prints the new version), then click the **↻ reload** icon on the extension's card in `chrome://extensions`. No zip downloads needed.
+
+## Install (alternative: zip)
+
+1. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select the unzipped `local-lead-url-lens-extension` folder.
 2. Open a LinkedIn People Search / Sales Navigator results tab and click the launcher.
 3. Set a vault passphrase → **Unlock** → **Save & verify** your OpenAI key (and Qwen key if using prose ICP / fuzzy locations).
 4. Paste your ICP, set a target, and click **Capture & score on this search**.
