@@ -1,4 +1,4 @@
-# Local Lead URL Lens 1.3.0
+# Local Lead URL Lens 1.4.0
 
 A standalone Manifest V3 extension that **captures LinkedIn People Search / Sales Navigator prospects and scores them locally against your ICP, then downloads a CSV** — with **no backend and no CRM**. It is a separate extension from the CRM-connected *Lead URL Lens*; nothing here talks to `lead-url-lens-crm…chatgpt.site`.
 
@@ -43,6 +43,14 @@ All rules derive from the ICP's accepted values — nothing is hardcoded to a sp
 - **Company-name domain evidence.** A firm literally named after the ICP's domain ("Dirigeante-Fondatrice chez **Focus Recrutement**") satisfies the domain half of an accepted role+domain title. Same flag + forced advisory review. In-house look-alikes ("Directeur du recrutement chez TotalEnergies") do **not** fire this rule — the domain word must be in the company name, not the role.
 - **Expansion v3.** Variants may include owner-operator equivalents ("Chef d'entreprise", "Dirigeant", "Gérant"…) only when strictly equivalent, plus essential single-token domain words as keyword variants. Cache regenerates automatically (versioned salt).
 - **CSV dedupe safeguard.** Rows are deduplicated by canonical profile URL at export time.
+
+### v1.4.0 — false-positive controls + Qualification column
+
+- **Domain corroboration for role-only titles.** An accepted title or variant that carries none of the ICP's *specific domain tokens* (the most specific token of each accepted phrase, e.g. "recrutement") no longer scores 1.0 on its own: "Directeur Général" or "Fondateur" alone needs a domain word somewhere on the prospect's card (title/section/headline/company). With corroboration → 1.0, flagged and force-reviewed; without → falls to embeddings. ICPs that define no domain at all keep the old behavior. Note: this also applies to your own domain-less accepted titles (e.g. "Directeur des Opérations").
+- **Stricter company-name evidence.** The company-name rule now requires the accepted phrase's *most specific* token in the company name ("Focus **Recrutement**" ✓; "CABINET CORRAZE" ✗ — the generic word "cabinet" alone no longer suffices).
+- **Variant hygiene + visibility.** Qwen-generated variants are deterministically filtered: kept only if they share a content token with your accepted values or are a known owner-operator equivalent — "Talent Partner"-type strays are discarded. The active (filtered) variant counts are shown in the panel and stored in `localIcpActive`.
+- **Wider advisory review.** Rows whose Job Title term came from embeddings only (no lexical evidence) get the advisory Qwen Review from score 40 upward with no upper cap — catching in-house look-alikes that land at 75–90. Clean lexical matches keep the 40–70 band. Verdicts never change the number.
+- **Qualification column.** New CSV column after the score: `qualified` when the numeric score is ≥ **75** (`QUALIFICATION_THRESHOLD` in `feed.js`), otherwise `unqualified` (NOT COMPUTED rows are `unqualified`).
 - **Cosine calibration.** Raw embedding cosines compress the range (~0.25–0.40 even for unrelated jobs). Calibration maps cosine **≤ 0.35 → 0** and **≥ 0.80 → 1** (linear between) before the weights apply, so wrong profiles fall toward 0 and near-synonyms toward 100. Constants: `CALIBRATION` in `feed.js`.
 - **ICP variant expansion (needs Qwen key).** One cached Qwen call expands your accepted titles/keywords into strict same-role variants — synonyms, abbreviations ("VP"/"Vice President"), and French/English translations ("Sales Director"/"Directeur Commercial"). Scoring takes the max over originals ∪ variants; your accepted values stay authoritative, and you can supply your own `job_title_variants` / `keyword_variants` lists in a structured ICP to skip Qwen.
 - **Persistent caches.** ICP criterion embeddings, location verdicts, and Qwen reviews persist across runs in `chrome.storage.local` (same ICP → no re-embedding, consistent location decisions, fewer API calls). Profile-text embeddings are reused within a run.
@@ -76,10 +84,10 @@ Paste text, choose a file, or set a raw URL. Either:
 `local-lead-icp-scores.csv` — UTF-8, **semicolon-delimited**, columns:
 
 ```
-Full Name;Job Title;Job Section;Headline;Location;ICP Search Score;Job Title (65);Job Section/Headline (20);Location (15);Qwen Review;Note;LinkedIn Url
+Full Name;Job Title;Job Section;Headline;Location;ICP Search Score;Qualification;Job Title (65);Job Section/Headline (20);Location (15);Qwen Review;Note;LinkedIn Url
 ```
 
-`ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; the three component columns show each sub-match as a percentage. `Qwen Review` holds the advisory verdict for borderline (40–70) scores when a Qwen key is set; `Note` explains `NOT COMPUTED` rows (`private_or_empty_profile`, `embeddings_unavailable`). One row per distinct prospect (canonical-URL deduplicated).
+`ICP Search Score` is an integer `0–100` or `NOT COMPUTED`; `Qualification` is `qualified` (score ≥ 75) or `unqualified`; the three component columns show each sub-match as a percentage. `Qwen Review` holds the advisory verdict for borderline/weak-evidence rows when a Qwen key is set; `Note` explains flags (`cross_field_title_match`, `private_or_empty_profile`, `embeddings_unavailable`). One row per distinct prospect (canonical-URL deduplicated).
 
 ## Install (recommended: git clone — updates without re-downloading zips)
 

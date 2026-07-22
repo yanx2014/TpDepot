@@ -6,7 +6,7 @@
 import {
   canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeIcp, icpEmbedTexts,
   scoreRow, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, expandIcpPrompt,
-  reviewPrompt, buildScoreCsv, dedupeRows, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
+  reviewPrompt, buildScoreCsv, dedupeRows, filterTitleVariants, filterKeywordVariants, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
   deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier,
   checkVerifier, KDF_ITERATIONS,
 } from "./feed.js";
@@ -138,6 +138,12 @@ async function buildScoringCtx(cfg, openaiKey, qwenKey) {
   let icp = activeIcp(raw);
   if (!icp.job_titles.length && !icp.keywords.length && !icp.locations.length) throw new Error("The ICP has no accepted values (job titles, keywords, or locations).");
   icp = await expandIcpValues(icp, cfg, qwenKey);
+  // Variant hygiene applied at use time (cached expansions get re-filtered too):
+  // keyword variants first, then title variants (which may relate via kept keywords).
+  const keptKeywordVariants = filterKeywordVariants(icp.keyword_variants || [], icp);
+  icp = {...icp, keyword_variants: keptKeywordVariants};
+  icp = {...icp, job_title_variants: filterTitleVariants(icp.job_title_variants || [], icp)};
+  await chrome.storage.local.set({localIcpActive: {job_title_variants: icp.job_title_variants, keyword_variants: icp.keyword_variants}});
   // ICP criterion vectors persist across runs (same ICP → no re-embedding).
   const icpTexts = icpEmbedTexts(icp);
   const textsHash = await sha256Hex(JSON.stringify(icpTexts));
@@ -220,8 +226,12 @@ async function scorePageRows(rows, ctx) {
     if (s.score === "NOT COMPUTED") row.note = "embeddings_unavailable";
     else {
       if (s.needs_review) row.note = "cross_field_title_match";
-      // Forced advisory review for weak-evidence title matches, plus the usual 40-70 band.
-      if (ctx.qwenKey && (s.needs_review || (s.score >= REVIEW_BAND.min && s.score <= REVIEW_BAND.max))) row.qwen_review = await qwenReview(rf, ctx);
+      // Advisory review coverage: weak-evidence lexical matches and embedding-only
+      // title scores review from 40 up (no upper cap — an 85 with no lexical evidence
+      // is exactly the case to audit); clean lexical matches only in the 40-70 band.
+      const weakEvidence = s.needs_review || s.title_from_embeddings;
+      const inBand = s.score >= REVIEW_BAND.min && s.score <= REVIEW_BAND.max;
+      if (ctx.qwenKey && ((weakEvidence && s.score >= REVIEW_BAND.min) || inBand)) row.qwen_review = await qwenReview(rf, ctx);
     }
     out.push(row);
   }
@@ -302,7 +312,9 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const meta = (await chrome.storage.local.get("localKeyMeta")).localKeyMeta || {};
     const vault = (await chrome.storage.local.get("localVault")).localVault || {};
     const cfg = await localConfig();
-    return {ok: true, meta, hasPassphrase: Boolean(vault.kdf && vault.verifier), unlocked: Boolean(await vaultSessionRaw()), cfg: {qwenModel: cfg.qwenModel, region: cfg.region}};
+    const active = (await chrome.storage.local.get("localIcpActive")).localIcpActive || null;
+    return {ok: true, meta, hasPassphrase: Boolean(vault.kdf && vault.verifier), unlocked: Boolean(await vaultSessionRaw()), cfg: {qwenModel: cfg.qwenModel, region: cfg.region},
+      variants: active ? {titles: (active.job_title_variants || []).length, keywords: (active.keyword_variants || []).length} : null};
   }
   if (message.type === "SET_PASSPHRASE") {
     const pass = String(message.passphrase || ""); if (pass.length < 6) return {ok: false, error: "Passphrase must be at least 6 characters."};

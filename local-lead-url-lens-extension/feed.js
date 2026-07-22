@@ -19,9 +19,12 @@ export const EMBED_MODEL = "text-embedding-3-small";
 // cluster (~0.25-0.40 unrelated, ~0.80+ near-synonym), so raw values compress the
 // 0-100 range. Cosine ≤ floor scores 0, ≥ ceil scores 1, linear in between.
 export const CALIBRATION = { floor: 0.35, ceil: 0.80 };
+// Numeric scores at or above this threshold export as "qualified", below (and
+// NOT COMPUTED) as "unqualified".
+export const QUALIFICATION_THRESHOLD = 75;
 export const SCORE_CSV_HEADERS = [
   "Full Name", "Job Title", "Job Section", "Headline", "Location",
-  "ICP Search Score", "Job Title (65)", "Job Section/Headline (20)", "Location (15)",
+  "ICP Search Score", "Qualification", "Job Title (65)", "Job Section/Headline (20)", "Location (15)",
   "Qwen Review", "Note", "LinkedIn Url",
 ];
 
@@ -108,6 +111,45 @@ export function activeIcp(icp) {
     // scoring takes the max over originals ∪ variants — the accepted values stay authoritative.
     job_title_variants: list("job_title_variants"), keyword_variants: list("keyword_variants"),
   };
+}
+// Specific domain tokens of the ICP. The KEYWORDS define the domain (single-token
+// keywords/variants directly; multi-token ones by their most specific, last token) —
+// accepted titles' trailing tokens are role words ("des Opérations"), not domain, so
+// they only serve as a fallback when the ICP defines no keywords at all. A lexical
+// title hit through a value carrying no specific domain token only counts when one of
+// these tokens appears somewhere on the prospect's card (domain corroboration). An ICP
+// that defines no domain at all imposes no such constraint.
+export function icpDomainInfo(icp) {
+  const specific = new Set();
+  const add = v => { const vt = contentTokens(v); if (vt.length === 1) specific.add(vt[0]); else if (vt.length >= 2) specific.add(vt[vt.length - 1]); };
+  for (const k of icp.keywords) add(k);
+  for (const k of (icp.keyword_variants || [])) add(k);
+  if (!specific.size) for (const t of icp.job_titles) { const vt = contentTokens(t); if (vt.length >= 2) specific.add(vt[vt.length - 1]); }
+  return { specific };
+}
+// Variant hygiene: Qwen-generated variants are kept only when they demonstrably relate
+// to the ICP — sharing a content token with the accepted values — or when they are a
+// known owner-operator equivalent. Everything else ("Talent Partner"-type strays that
+// would produce unexplainable 100s) is discarded deterministically.
+const OWNER_OPERATOR_VARIANTS = ["chef d'entreprise", "dirigeant", "gérant", "président", "président fondateur", "pdg", "ceo", "directeur général", "directrice générale", "managing director", "general manager", "owner", "founder", "fondateur", "co-fondateur", "cofondateur"];
+export function filterKeywordVariants(variants, icp) {
+  const base = new Set();
+  for (const v of [...icp.job_titles, ...icp.keywords]) for (const t of contentTokens(v)) base.add(t);
+  return [...new Set(variants)].filter(v => {
+    const vt = contentTokens(v);
+    if (!vt.length) return false;
+    return vt.length === 1 || vt.some(t => base.has(t));
+  }).slice(0, 80);
+}
+export function filterTitleVariants(variants, icp) {
+  const base = new Set();
+  for (const v of [...icp.job_titles, ...icp.keywords, ...(icp.keyword_variants || [])]) for (const t of contentTokens(v)) base.add(t);
+  const owner = new Set(OWNER_OPERATOR_VARIANTS.map(v => contentTokens(v).join(" ")));
+  return [...new Set(variants)].filter(v => {
+    const vt = contentTokens(v);
+    if (!vt.length) return false;
+    return vt.some(t => base.has(t)) || owner.has(vt.join(" "));
+  }).slice(0, 80);
 }
 // Qwen prompt: compile a prose/markdown ICP into the accepted-value lists (one cached call).
 // Weights are NOT requested — they are fixed by the contract.
@@ -250,27 +292,40 @@ function bestMatch(text, values, vectors) {
 //     token appears in the company name ("Dirigeante-Fondatrice chez Focus
 //     Recrutement"). Full hit + forced advisory review.
 // All head/phrase matches are negation-guarded (ex/ancien/former/aspiring/futur).
-export function titleLexicalEvidence(rf, titleValues) {
+export function titleLexicalEvidence(rf, titleValues, domain = { specific: new Set() }) {
   const fields = [rf.job_title, rf.headline, rf.job_section].map(normText).filter(Boolean);
   if (!fields.length) return { hit: false, review: false };
-  const allText = fields.join(" ");
   const companyText = normText(rf.company || "");
+  const allText = fields.join(" ") + (companyText ? " " + companyText : "");
+  // Domain corroboration: with no domain defined, the ICP imposes no constraint.
+  const noDomain = domain.specific.size === 0;
+  const cardHasSpecific = noDomain || [...domain.specific].some(t => hasToken(allText, t));
   const roleFields = [rf.job_title, rf.headline].map(normText).filter(Boolean);
-  let loose = false;
+  let best = null;
+  const accept = review => { if (best === null || (best.review && !review)) best = { review }; };
   for (const v of titleValues) {
     const vt = contentTokens(v);
     if (!vt.length) continue;
+    const valueHasSpecific = noDomain || vt.some(t => domain.specific.has(t));
     if (vt.length === 1) {
-      if (vt[0].length >= 2 && fields.some(f => hasTokenGuarded(f, vt[0]))) return { hit: true, review: false };
+      if (vt[0].length >= 2 && fields.some(f => hasTokenGuarded(f, vt[0]))) {
+        if (valueHasSpecific) accept(false);                 // self-evident
+        else if (cardHasSpecific) accept(true);              // role-only, corroborated → review
+      }
       continue;
     }
-    if (fields.some(f => orderedGapMatch(f, vt, 3))) return { hit: true, review: false };
+    if (fields.some(f => orderedGapMatch(f, vt, 3))) {
+      if (valueHasSpecific) accept(false);
+      else if (cardHasSpecific) accept(true);
+      continue;
+    }
     const head = vt[0], rest = vt.slice(1);
     if (!roleFields.some(f => hasTokenGuarded(f, head))) continue;
-    if (rest.every(t => hasToken(allText, t))) loose = true;
-    else if (companyText && rest.some(t => hasToken(companyText, t))) loose = true;
+    if (!valueHasSpecific && !cardHasSpecific) continue;
+    if (rest.every(t => hasToken(allText, t))) accept(true);
+    else if (companyText && hasToken(companyText, vt[vt.length - 1])) accept(true); // most specific token in company name
   }
-  return loose ? { hit: true, review: true } : { hit: false, review: false };
+  return best ? { hit: true, review: best.review } : { hit: false, review: false };
 }
 // Score one captured row against the ICP. `vectors` maps normalized text → embedding.
 // Returns {score, job_title, job_section_headline, location, needs_review} where score
@@ -283,15 +338,17 @@ export function scoreRow(rf, icp, vectors, locationScore) {
   const sectionHeadlineText = normText(`${rf.job_section} ${rf.headline}`);
   const titleValues = [...new Set([...icp.job_titles, ...(icp.job_title_variants || [])])];
   const semanticValues = [...new Set([...titleValues, ...icp.keywords, ...(icp.keyword_variants || [])])];
-  let needs_review = false;
+  const domain = icpDomainInfo(icp);
+  let needs_review = false, title_from_embeddings = false;
 
-  // Job Title (65): lexical evidence over title+headline(+section), else calibrated
-  // best-cosine over BOTH the extracted title and the headline.
+  // Job Title (65): domain-corroborated lexical evidence over title+headline(+section),
+  // else calibrated best-cosine over BOTH the extracted title and the headline.
   let jt = 0;
   if (icp.job_titles.length) {
-    const ev = titleLexicalEvidence(rf, titleValues);
+    const ev = titleLexicalEvidence(rf, titleValues, domain);
     if (ev.hit) { jt = 1.0; needs_review = ev.review; }
     else {
+      title_from_embeddings = true;
       const candidates = [jobTitleText, headlineText].filter(Boolean);
       if (!candidates.length) candidates.push(sectionHeadlineText);
       let best = null;
@@ -306,7 +363,7 @@ export function scoreRow(rf, icp, vectors, locationScore) {
     else jsh = calibrate(bestMatch(sectionHeadlineText || jobTitleText, semanticValues, vectors));
   }
   if (jt === null || jsh === null) {
-    return { score: "NOT COMPUTED", job_title: null, job_section_headline: null, location: locationScore, needs_review: false };
+    return { score: "NOT COMPUTED", job_title: null, job_section_headline: null, location: locationScore, needs_review: false, title_from_embeddings };
   }
   const loc = icp.locations.length ? (Number.isFinite(locationScore) ? locationScore : 0) : 0;
   const total = WEIGHTS.job_title * (jt || 0) + WEIGHTS.job_section_headline * (jsh || 0) + WEIGHTS.location * loc;
@@ -316,6 +373,7 @@ export function scoreRow(rf, icp, vectors, locationScore) {
     job_section_headline: jsh || 0,
     location: loc,
     needs_review,
+    title_from_embeddings,
   };
 }
 // R6: canonical-URL dedupe safeguard applied at CSV build time.
@@ -342,12 +400,15 @@ function csvCell(value) {
   return /[";\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 function pct(value) { return value === null || value === undefined ? "" : `${Math.round(Number(value) * 100)}%`; }
+export function qualification(score) {
+  return Number.isFinite(Number(score)) && Number(score) >= QUALIFICATION_THRESHOLD ? "qualified" : "unqualified";
+}
 export function buildScoreCsv(rows) {
   const lines = [SCORE_CSV_HEADERS.join(";")];
   for (const r of rows) {
     lines.push([
       r.full_name, r.job_title, r.job_section, r.headline, r.location,
-      r.icp_score, pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location),
+      r.icp_score, qualification(r.icp_score), pct(r.c_job_title), pct(r.c_job_section_headline), pct(r.c_location),
       r.qwen_review || "", r.note || "", r.linkedin_url,
     ].map(csvCell).join(";"));
   }
