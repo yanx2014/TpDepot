@@ -102,6 +102,7 @@ export function rowFieldsFromCapture(data = {}) {
     job_section,
     headline,
     company: normText(data.company) || extractCompany(job_title, job_section, headline),
+    company_profile_url: String(data.company_profile_url || "").split(/[?#]/)[0].replace(/\/+$/, ""),
     location: normText(data.location),
     linkedin_url: canonicalProfileUrl(data.profile_url) || canonicalUrl(data.profile_url),
   };
@@ -187,10 +188,10 @@ export function expandIcpPrompt(icp) {
 // search score does not cover (industry, headcount band, compound AND-keyword groups).
 // Generic: works for one or many ICPs of any industry; fields an ICP omits are skipped.
 export function compileFullIcpPrompt(icpText) {
-  const system = `You convert an Ideal Customer Profile (ICP) document into a strict JSON schema for deterministic matching. The document may define ONE or MORE ICPs. Extract ONLY what the document states; never invent. Output ONLY JSON:
-{"icps":[{"name":"<short name>","job_titles":["…"],"industries":["…"],"headcount_min":<int|null>,"headcount_max":<int|null>,"keyword_groups":[["…"],["…"]],"locations":["…"]}]}
-Rules: a headcount like "11-50 employés" → headcount_min 11, headcount_max 50. keyword_groups: each AND-group of the ICP's keyword expression becomes one array of its OR-alternatives (e.g. (A OR B) AND (C OR D) → [[A,B],[C,D]]). Use [] or null for fields an ICP does not define.`;
-  return { system, user: `ICP document:\n${icpText}`, max_tokens: 1800, temperature: 0, json: true };
+  const system = `You convert an Ideal Customer Profile (ICP) document into a strict JSON schema for deterministic COMPANY matching. The document may define ONE or MORE ICPs. Extract ONLY each ICP's company Industry and company Headcount; never invent. Output ONLY JSON:
+{"icps":[{"name":"<short name>","industries":["<industry label>", "..."],"headcount_min":<int|null>,"headcount_max":<int|null>}]}
+Rules: a headcount like "11-50 employés" → headcount_min 11, headcount_max 50; "1-50 employés" → 1,50. Use [] for industries an ICP does not state and null for a missing headcount bound. Ignore job titles, keywords and location — those are handled elsewhere.`;
+  return { system, user: `ICP document:\n${icpText}`, max_tokens: 900, temperature: 0, json: true };
 }
 // Parse a LinkedIn headcount text ("11-50 employés", "0-1 employés", "10 000+ employés").
 export function parseHeadcountRange(text) {
@@ -218,11 +219,6 @@ export function industryTokensMatch(pageIndustry, accepted) {
   for (const a of accepted) for (const t of contentTokens(a)) if (t.length > 3 && pt.has(t)) return true;
   return null;
 }
-// Compound keyword rule: every AND-group must have >=1 OR-alternative lexically present.
-export function keywordGroupsOk(textBlob, groups) {
-  if (!Array.isArray(groups) || !groups.length) return true;
-  return groups.every(g => (Array.isArray(g) && g.length) ? lexicalMatch(textBlob, g) : true);
-}
 // Parse LinkedIn relative timestamps ("3 j", "5 h", "1 sem.", "2 semaines", "3d", "1w",
 // "2 mois") into age in days; null when unparseable.
 export function parseRelativeAgeDays(text) {
@@ -237,29 +233,29 @@ export function parseRelativeAgeDays(text) {
   if (/^(mois|mo|month)/.test(u)) return n * 30;
   return n * 365;
 }
-// Evaluate the remaining ICP fields for one qualified prospect against every compiled
-// ICP. Deterministic; industryOkByIcp[i] (true/false/null) carries any cached Qwen
-// industry normalization the caller resolved. TRUE when at least one ICP fully passes.
-export function evaluateIcpMatch({ rf, aboutText = "", companyIndustry = "", companyHeadcountText = "", companyDescription = "", industryOkByIcp = [] }, fullIcp) {
+// ICP Match on the remaining ICP structural fields ONLY: company Industry AND company
+// Headcount (job title + keywords are handled by the search score, not here). For each
+// compiled ICP, every field that ICP defines must pass; an ICP defining neither field
+// passes trivially. TRUE if at least one ICP passes. industryOkByIcp[i] carries any
+// cached Qwen industry normalization the caller resolved. Deterministic.
+export function evaluateIcpMatch({ companyIndustry = "", companyHeadcountText = "", industryOkByIcp = [] }, fullIcp) {
   const icps = (fullIcp && fullIcp.icps) || [];
   if (!icps.length) return { match: "", matched_icp: "", details: "no_full_icp" };
-  const blob = normText([rf.job_title, rf.job_section, rf.headline, rf.company, aboutText, companyDescription].join(" "));
   const range = parseHeadcountRange(companyHeadcountText);
   const failsAll = [];
   for (const [i, icp] of icps.entries()) {
-    const fails = [];
-    const titles = (icp.job_titles || []).map(normText).filter(Boolean);
-    if (titles.length && !titleLexicalEvidence(rf, titles, { specific: new Set() }).hit) fails.push("title");
     const inds = (icp.industries || []).map(normText).filter(Boolean);
+    const hasHead = icp.headcount_min != null || icp.headcount_max != null;
+    if (!inds.length && !hasHead) return { match: "TRUE", matched_icp: icp.name || `ICP ${i + 1}`, details: "no_structural_fields" };
+    const fails = [];
     if (inds.length) {
       const ok = industryOkByIcp[i] === true || industryTokensMatch(companyIndustry, inds) === true;
       if (!ok) fails.push(companyIndustry ? "industry" : "industry_unknown");
     }
-    if (icp.headcount_min != null || icp.headcount_max != null) {
+    if (hasHead) {
       const ok = headcountOverlaps(range, icp.headcount_min, icp.headcount_max);
-      if (ok !== true) fails.push(range ? `headcount:${normText(companyHeadcountText)}` : "headcount_unknown");
+      if (ok !== true) fails.push(range ? `headcount:${normText(companyHeadcountText)}∉${icp.headcount_min ?? 0}-${icp.headcount_max ?? "∞"}` : "headcount_unknown");
     }
-    if (!keywordGroupsOk(blob, icp.keyword_groups)) fails.push("keywords");
     if (!fails.length) return { match: "TRUE", matched_icp: icp.name || `ICP ${i + 1}`, details: "" };
     failsAll.push(`${icp.name || `ICP ${i + 1}`}: ${fails.join(",")}`);
   }

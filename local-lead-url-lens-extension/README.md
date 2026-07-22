@@ -1,4 +1,4 @@
-# Local Lead URL Lens 1.7.0
+# Local Lead URL Lens 1.8.0
 
 A standalone Manifest V3 extension that **captures LinkedIn People Search / Sales Navigator prospects and scores them locally against your ICP, then downloads a CSV** — with **no backend and no CRM**. It is a separate extension from the CRM-connected *Lead URL Lens*; nothing here talks to `lead-url-lens-crm…chatgpt.site`.
 
@@ -55,6 +55,15 @@ All rules derive from the ICP's accepted values — nothing is hardcoded to a sp
 ### v1.5.0 — Company column + extraction
 
 A **Company** column, parsed from the Job Section, Headline, **and** Job Title (via `chez` / `at` / `@`). This also fixes profiles whose firm name lives only in the headline (e.g. "Directrice … @ C2P Recrutement"): the company-name domain evidence now fires and the row scores correctly.
+
+### v1.8.0 — pipelined ICP Match (industry ∧ headcount) + crash fix
+
+- **Fix:** ported the missing `acquireLinkedInWorkerTab` / `ensureProfileReceiver` / `closeWorkerTab` helpers into the local worker (the `acquireLinkedInWorkerTab is not defined` crash at the phase boundary).
+- **Simplified rule:** **ICP Match = Industry ∧ Company Headcount only** (job title + keywords already live in the score). For each compiled ICP, every field that ICP *defines* must pass; an ICP defining neither passes trivially. TRUE if any ICP passes.
+- **Concurrent pipeline (two tabs):** the search tab paginates + scores while a match consumer works the qualified queue in a background worker tab. A qualified row is **committed/exported only once its ICP Match is resolved** (unqualified rows commit instantly) — mid-run downloads and crashes only ever contain complete rows. State writes are serialized so the loops can't clobber each other; the queue is durable and resumable.
+- **Checkpoint isolation:** a checkpoint on the search tab pauses only capture; one in the worker tab pauses only matching — the other keeps running. Resume continues both.
+- **Cost-optimal company resolution:** company name in the persistent cache → **0 page loads**; else the company URL already on the search card → 1 company-page load; else a deep profile visit to find the URL; results cached by **name and URL**. No keyword/About analysis → lower token + page cost than v1.7.0.
+- **Live indicators:** panel tiles show **Discovered / Captured / Qualified / Match TRUE / Stage**, with a per-prospect status line before each commit.
 
 ### v1.7.0 — ICP Match phase (remaining ICP fields, qualified prospects only)
 

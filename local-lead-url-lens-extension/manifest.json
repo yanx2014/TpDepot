@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Lead URL Lens",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Capture LinkedIn People Search / Sales Navigator prospects and score them locally against your ICP (Job Title 65 + Job Section/Headline 20 + Location 15) with OpenAI embeddings — no backend/CRM — then download the results as a CSV.",
   "permissions": ["activeTab", "tabs", "storage", "scripting", "downloads", "alarms"],
   "host_permissions": [

@@ -19,6 +19,28 @@ let wakeLock = false;
 /* ------------------------------------------------------------- durable state */
 async function stored() { return (await chrome.storage.local.get("operationState")).operationState || {mode: "idle"}; }
 async function save(patch) { const current = await stored(), next = {...current, ...patch, updated_at: new Date().toISOString()}; await chrome.storage.local.set({operationState: next}); return next; }
+// Serialize state writes so the concurrent capture loop and match consumer can't lose
+// each other's updates (read-modify-write is made atomic by chaining).
+let ioChain = Promise.resolve();
+function saveLocked(patch) { const p = ioChain.then(() => save(patch), () => save(patch)); ioChain = p.catch(() => {}); return p; }
+// --- Background worker tab (ICP Match phase). Ported from the capture extension. ---
+async function acquireLinkedInWorkerTab(preferredUrl = "https://www.linkedin.com/feed/") {
+  const state = await stored();
+  if (Number(state.workerTabId)) { try { const tab = await chrome.tabs.get(Number(state.workerTabId)); if (tab?.id && /^https:\/\/www\.linkedin\.com\//.test(tab.url || preferredUrl)) { try { await chrome.tabs.update(tab.id, {autoDiscardable: false}); } catch {} return {tab, owned: true}; } } catch {} }
+  const tab = await chrome.tabs.create({url: preferredUrl, active: false});
+  try { await chrome.tabs.update(tab.id, {autoDiscardable: false}); } catch {}
+  await saveLocked({workerTabId: tab.id});
+  return {tab, owned: true};
+}
+async function ensureProfileReceiver(tabId) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try { const response = await chrome.tabs.sendMessage(tabId, {type: "PROFILE_RECEIVER_PING"}); if (response?.ready) return true; } catch {}
+    if (attempt === 2) try { await chrome.scripting.executeScript({target: {tabId}, files: ["experience-contract.js", "content.js"]}); } catch {}
+    await sleep(250);
+  }
+  return false;
+}
+async function closeWorkerTab() { const state = await stored(), id = Number(state.workerTabId || 0); if (id) try { await chrome.tabs.remove(id); } catch {} await saveLocked({workerTabId: 0}); }
 
 /* ------------------------------------------------------------- tab plumbing (same as capture extension) */
 async function activeLinkedIn(searchOnly = false) {
@@ -198,7 +220,7 @@ async function scorePageRows(rows, ctx) {
   for (const rf of fields) {
     const base = {
       full_name: rf.full_name, job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline,
-      company: rf.company, location: rf.location, linkedin_url: rf.linkedin_url, note: "",
+      company: rf.company, company_profile_url: rf.company_profile_url || "", location: rf.location, linkedin_url: rf.linkedin_url, note: "",
     };
     if (!rf.full_name && !rf.headline && !rf.job_section) {
       out.push({...base, icp_score: "NOT COMPUTED", c_job_title: null, c_job_section_headline: null, c_location: null, qualification: "unqualified", note: "private_or_empty_profile"});
@@ -259,8 +281,9 @@ async function captureCompanyAbout(tabId, companyUrl) {
   await chrome.tabs.update(tabId, {url: companyUrl.replace(/\/$/, "") + "/about/", active: false});
   await waitLoaded(tabId);
   if (!await ensureProfileReceiver(tabId)) return null;
-  try { const c = await chrome.tabs.sendMessage(tabId, {type: "CAPTURE_COMPANY_DEEP"}); return (c && !c.blocked) ? c : null; } catch { return null; }
+  try { const c = await chrome.tabs.sendMessage(tabId, {type: "CAPTURE_COMPANY_DEEP"}); if (c?.blocked && c.error_code === "linkedin_checkpoint") return {checkpoint: true}; return (c && !c.blocked) ? c : null; } catch { return null; }
 }
+const compFrom = c => ({industry: normText(c.industry), company_size: normText(c.company_size)});
 // Fallback signal when no company data exists: age (days) of the latest post/comment.
 async function latestActivityAgeDays(tabId, profileUrl) {
   let best = null;
@@ -275,73 +298,60 @@ async function latestActivityAgeDays(tabId, profileUrl) {
   }
   return best;
 }
-// Visit each QUALIFIED prospect's profile (and its company /about/ page, cached by
-// company URL across prospects and runs) and compute ICP Match on the remaining ICP
-// fields. Fallback chain when company data is unavailable: company URL from the latest
-// experience description; else latest post/comment age < 7 days → ICP Match TRUE.
-async function runIcpMatchPhase(ctx) {
-  const state0 = await stored();
-  const results = state0.results || [];
-  const fullIcp = await compileFullIcp(ctx.cfg, ctx.qwenKey);
-  if (!fullIcp) {
-    for (const r of results) if (r.qualification === "qualified" && !r.icp_match) r.icp_match_details = "icp_match_not_evaluated_no_full_icp";
-    await save({results}); return true;
+// Compute ICP Match (industry ∧ headcount) for ONE qualified prospect. Company data is
+// resolved cheapest-first: company-name cache → company URL on the search card →
+// (only if needed) a deep profile visit for the company link / experience-description
+// URL. New company data is cached by both name and URL. Returns the fields to merge, or
+// {checkpoint:true} on a LinkedIn checkpoint. Fallback when no company data exists:
+// latest post/comment < 7 days → TRUE, else FALSE.
+async function computeIcpMatch(row, tabId, mctx, companyCache) {
+  const fullIcp = mctx.fullIcp;
+  const nameKey = row.company ? "name:" + fold(row.company) : "";
+  const cacheUrl = u => "url:" + fold(String(u).split(/[?#]/)[0].replace(/\/+$/, ""));
+  let comp = null, source = "";
+  if (nameKey && companyCache[nameKey]) { comp = companyCache[nameKey]; source = "name_cache"; }
+  const tryUrl = async (url, tag) => {
+    const uk = cacheUrl(url);
+    if (companyCache[uk]) { comp = companyCache[uk]; source = tag + "_cache"; return "hit"; }
+    const captured = await captureCompanyAbout(tabId, url);
+    if (captured?.checkpoint) return "checkpoint";
+    if (captured) { comp = compFrom(captured); companyCache[uk] = comp; if (nameKey) companyCache[nameKey] = comp; source = tag; return "hit"; }
+    return "miss";
+  };
+  // 1) company URL already on the search card
+  if (!comp && row.company_profile_url) { if (await tryUrl(row.company_profile_url, "card_url") === "checkpoint") return {checkpoint: true}; }
+  // 2) deep profile visit only if still unresolved — grab the company link / description URL
+  if (!comp) {
+    const deep = await captureDeepProfile(tabId, row.linkedin_url);
+    if (deep?.blocked && deep.error_code === "linkedin_checkpoint") return {checkpoint: true};
+    const url2 = (!deep?.blocked && (deep.company_profile_url || deep.company_url_from_description)) || "";
+    if (url2) { if (await tryUrl(url2, "deep_url") === "checkpoint") return {checkpoint: true}; }
   }
-  const companyCache = (await chrome.storage.local.get("localCompanyCache")).localCompanyCache || {};
-  const qualified = results.map((r, i) => r.qualification === "qualified" ? i : -1).filter(i => i >= 0);
-  if (!qualified.length) return true;
-  const worker = await acquireLinkedInWorkerTab(results[qualified[0]].linkedin_url || "https://www.linkedin.com/feed/");
-  let index = Number(state0.matchIndex || 0);
-  while (index < qualified.length) {
-    let s = await stored(); if (s.cancelled) return false;
-    while (s.paused) { await sleep(400); s = await stored(); if (s.cancelled) return false; }
-    const row = results[qualified[index]];
-    await save({stage: "ICP_MATCH", matchIndex: index, message: `ICP Match ${index + 1}/${qualified.length}: ${row.full_name || row.linkedin_url}`});
-    try {
-      const deep = await captureDeepProfile(worker.tab.id, row.linkedin_url);
-      if (deep?.blocked && deep.error_code === "linkedin_checkpoint") { await save({paused: true, stage: "BLOCKED", message: "LinkedIn checkpoint during ICP Match. Resolve it in the worker tab, then press Resume."}); return false; }
-      const rf = {job_title: row.job_title, job_section: row.job_section, headline: row.headline, company: row.company, location: row.location};
-      const companyUrl = (!deep?.blocked && (deep.company_profile_url || deep.company_url_from_description)) || "";
-      let comp = null;
-      if (companyUrl) {
-        const ck = fold(companyUrl);
-        if (companyCache[ck]) comp = companyCache[ck];
-        else {
-          const captured = await captureCompanyAbout(worker.tab.id, companyUrl);
-          if (captured) { comp = {industry: normText(captured.industry), company_size: normText(captured.company_size), description: normText(captured.description).slice(0, 4000)}; companyCache[ck] = comp; try { await chrome.storage.local.set({localCompanyCache: companyCache}); } catch {} }
-        }
-      }
-      if (comp && (comp.industry || comp.company_size || comp.description)) {
-        row.company_industry = comp.industry; row.company_headcount = comp.company_size;
-        const industryOkByIcp = [];
-        for (const icp of fullIcp.icps) {
-          const inds = (icp.industries || []).map(normText).filter(Boolean);
-          industryOkByIcp.push(inds.length ? await resolveIndustryOk(comp.industry, inds, ctx) : null);
-        }
-        const v = evaluateIcpMatch({rf, aboutText: deep?.about_text || "", companyIndustry: comp.industry, companyHeadcountText: comp.company_size, companyDescription: comp.description, industryOkByIcp}, fullIcp);
-        row.icp_match = v.match; row.matched_icp = v.matched_icp; row.icp_match_details = v.details;
-      } else {
-        const age = await latestActivityAgeDays(worker.tab.id, row.linkedin_url);
-        if (age !== null && age < 7) { row.icp_match = "TRUE"; row.matched_icp = ""; row.icp_match_details = `company_unavailable_recent_activity(${Math.round(age * 10) / 10}d)`; }
-        else { row.icp_match = "FALSE"; row.matched_icp = ""; row.icp_match_details = age === null ? "company_unavailable_no_activity" : "company_unavailable_stale_activity"; }
-      }
-    } catch (e) { row.icp_match = row.icp_match || ""; row.icp_match_details = `icp_match_error:${String(e && e.message || "error").slice(0, 60)}`; }
-    index += 1;
-    await save({results, matchIndex: index});
+  if (comp && (comp.industry || comp.company_size)) {
+    const industryOkByIcp = [];
+    for (const icp of fullIcp.icps) { const inds = (icp.industries || []).map(normText).filter(Boolean); industryOkByIcp.push(inds.length ? await resolveIndustryOk(comp.industry, inds, mctx) : null); }
+    const v = evaluateIcpMatch({companyIndustry: comp.industry, companyHeadcountText: comp.company_size, industryOkByIcp}, fullIcp);
+    return {company_industry: comp.industry, company_headcount: comp.company_size, icp_match: v.match, matched_icp: v.matched_icp, icp_match_details: (v.details ? v.details + " · " : "") + `src:${source}`};
   }
-  return true;
+  // 3) fallback — activity recency
+  const age = await latestActivityAgeDays(tabId, row.linkedin_url);
+  if (age !== null && age < 7) return {icp_match: "TRUE", matched_icp: "", icp_match_details: `company_unavailable_recent_activity(${Math.round(age * 10) / 10}d)`};
+  return {icp_match: "FALSE", matched_icp: "", icp_match_details: age === null ? "company_unavailable_no_activity" : "company_unavailable_stale_activity"};
 }
 
 /* ------------------------------------------------------------- CSV finish */
+// Only rows that are "ready" (unqualified, or qualified WITH ICP Match resolved) are
+// ever exported — a qualified prospect is never imported before its ICP Match is done.
+const readyRows = results => (results || []).filter(r => r.qualification !== "qualified" || r.icp_match);
 async function finishLocal(results, stopReason) {
-  const rows = dedupeRows(results);
+  const rows = dedupeRows(readyRows(results));
   let downloadOk = false, downloadError = "";
   try { const csv = buildScoreCsv(rows); await chrome.storage.local.set({localCsv: csv}); await chrome.downloads.download({url: csvDataUrl(csv), filename: "local-lead-icp-scores.csv", saveAs: false}); downloadOk = true; }
   catch (error) { downloadError = error?.message || "download_failed"; }
-  const scored = rows.filter(r => Number.isFinite(Number(r.icp_score))).length, notComputed = rows.length - scored;
+  const qual = rows.filter(r => r.qualification === "qualified").length, matched = rows.filter(r => r.icp_match === "TRUE").length;
   await save({running: false, stage: downloadOk ? "DONE" : "FAILED", stop_reason: stopReason,
     message: downloadOk
-      ? `Done · ${rows.length} prospect(s) · ${scored} scored · ${notComputed} not computed · CSV downloaded (${stopReason.replaceAll("_", " ")})`
+      ? `Done · ${rows.length} prospect(s) · ${qual} qualified · ${matched} ICP Match TRUE · CSV downloaded (${stopReason.replaceAll("_", " ")})`
       : `Run finished but CSV export failed: ${downloadError}. Use Download CSV to retry.`});
 }
 
@@ -354,63 +364,112 @@ async function runLocalCapture({target, resume = false} = {}) {
   if (openaiKey === null || qwenKey === null) { await save({running: true, paused: true, stage: "BLOCKED", message: "Key vault is locked — unlock it with your passphrase, then press Resume."}); return; }
   if (!openaiKey) { await save({running: false, stage: "FAILED", message: "Set & verify your OpenAI key (embeddings) before running."}); return; }
   const prior = resume ? await stored() : {};
-  // Resuming mid ICP-Match phase: skip the capture loop entirely and continue phase 2.
-  if (resume && prior.mode === "local" && (prior.stage === "ICP_MATCH" || (prior.stage === "BLOCKED" && Number.isFinite(Number(prior.matchIndex))))) {
-    await save({running: true, paused: false, cancelled: false, stage: "ICP_MATCH", message: "Resuming ICP Match phase…"});
-    const done = await runIcpMatchPhase({cfg, qwenKey});
-    if (!done) return;
-    const st = await stored();
-    await finishLocal(st.results || [], st.stop_reason || "batch_complete");
-    return;
-  }
   let tab; try { tab = await resolveCaptureTab(prior, !resume); } catch (e) { await save({running: false, stage: "FAILED", message: e.message}); return; }
-  const tabId = tab.id, sourceSearch = resume && prior.sourceSearch ? prior.sourceSearch : tab.url;
+  const captureTabId = tab.id, sourceSearch = resume && prior.sourceSearch ? prior.sourceSearch : tab.url;
   const requested = Math.min(MAX_TARGET, Math.max(1, Number(resume ? prior.target : target) || 50));
-  const sourceUrl = new URL(sourceSearch), page = resume ? Math.max(1, Number(prior.page) || 1) : Math.max(1, Number(sourceUrl.searchParams.get("page")) || 1);
-  if (resume && !await restoreCapturePage(tabId, sourceSearch, page)) { await save({running: false, stage: "FAILED", message: "The LinkedIn search page could not be restored."}); return; }
-
+  const startPage = resume ? Math.max(1, Number(prior.page) || 1) : Math.max(1, Number(new URL(sourceSearch).searchParams.get("page")) || 1);
+  if (resume && !prior.captureStop && !await restoreCapturePage(captureTabId, sourceSearch, startPage)) { await save({running: false, stage: "FAILED", message: "The LinkedIn search page could not be restored."}); return; }
   let ctx; try { ctx = await buildScoringCtx(cfg, openaiKey, qwenKey); }
   catch (e) { await save({running: false, stage: "FAILED", message: `ICP / embeddings setup failed: ${e.message}`}); return; }
+  const fullIcp = await compileFullIcp(cfg, qwenKey);
+  const mctx = {cfg, qwenKey, fullIcp};
+  const companyCache = (await chrome.storage.local.get("localCompanyCache")).localCompanyCache || {};
 
-  const seen = new Set(prior.processedProfiles || []);
-  let results = resume ? (prior.results || []) : [];
-  let collected = results.length, discovered = Number(prior.discovered || 0), pagesProcessed = Number(prior.pagesProcessed || 0), currentPage = page, stopReason = "search_results_complete";
-  await save({mode: "local", running: true, paused: false, cancelled: false, target: requested, sourceSearch, captureTabId: tabId, captureWindowId: tab.windowId, page: currentPage, processedProfiles: [...seen], results, total: requested, done: collected, discovered, pagesProcessed, stage: "SCAN_PAGE", message: resume ? "Resumed local capture + scoring" : "Capturing and scoring prospects on this search…"});
-  try {
-    while (collected < requested) {
-      const state = await stored(); if (state.cancelled) { stopReason = "cancelled"; break; }
-      while ((await stored()).paused) await sleep(250);
-      const result = await capturePageWithRecovery(tabId, currentPage);
-      if (result?.error_code === "linkedin_checkpoint") { await save({running: true, paused: true, stage: "BLOCKED", message: "LinkedIn security checkpoint detected. Resolve it in the tab, then press Resume."}); return; }
-      if (result?.blocked) { stopReason = result.error_code || "unsupported_search_layout"; throw new Error(stopReason); }
-      const page_fingerprint = result.page_fingerprint || "";
-      discovered += (result.rows || []).length; pagesProcessed += 1;
-      const newRows = (result.captured || []).filter(row => row.profile_url && !seen.has(canonicalProfileUrl(row.profile_url) || row.profile_url));
-      const take = newRows.slice(0, requested - collected);
-      if (take.length) {
-        await save({stage: "SCORE", message: `Scoring ${take.length} new prospect(s) from page ${currentPage}…`});
-        const scored = await scorePageRows(take, ctx);
-        results = [...results, ...scored]; collected += scored.length;
-        take.forEach(row => seen.add(canonicalProfileUrl(row.profile_url) || row.profile_url));
+  // Single in-memory source of truth shared by the two concurrent loops.
+  const M = {
+    rows: resume ? (prior.results || []) : [],
+    seen: new Set(prior.processedProfiles || []),
+    discovered: Number(prior.discovered || 0),
+    pagesProcessed: Number(prior.pagesProcessed || 0),
+    currentPage: startPage,
+    captureDone: false,
+    captureStop: (resume && prior.captureStop) || "",
+  };
+  const pending = () => M.rows.filter(r => r.qualification === "qualified" && !r.icp_match);
+  const readyLocal = () => M.rows.filter(r => r.qualification !== "qualified" || r.icp_match);
+  const counts = () => {
+    const qual = M.rows.filter(r => r.qualification === "qualified");
+    return {total: requested, done: readyLocal().length, discovered: M.discovered, pagesProcessed: M.pagesProcessed,
+      qualifiedCount: qual.length, matchedCount: qual.filter(r => r.icp_match).length,
+      matchTrueCount: M.rows.filter(r => r.icp_match === "TRUE").length, pendingCount: pending().length};
+  };
+  const persist = (extra = {}) => saveLocked({mode: "local", results: M.rows, processedProfiles: [...M.seen], page: M.currentPage, ...counts(), ...extra});
+
+  await saveLocked({mode: "local", running: true, paused: false, cancelled: false, capturePaused: false, matchPaused: false,
+    target: requested, sourceSearch, captureTabId, captureWindowId: tab.windowId, page: M.currentPage, results: M.rows, processedProfiles: [...M.seen],
+    ...counts(), stage: M.captureStop ? "ICP_MATCH" : "SCAN_PAGE", message: resume ? "Resumed capture + ICP Match" : "Capturing, scoring and ICP-matching on this search..."});
+
+  // ---- CAPTURE LOOP (search tab) -- never blocked by matching ----
+  async function captureLoop() {
+    if (M.captureStop) { M.captureDone = true; return; }
+    try {
+      while (M.rows.length < requested) {
+        let s = await stored(); if (s.cancelled) { M.captureStop = "cancelled"; return; }
+        while (s.paused || s.capturePaused) { await sleep(300); s = await stored(); if (s.cancelled) { M.captureStop = "cancelled"; return; } }
+        const result = await capturePageWithRecovery(captureTabId, M.currentPage);
+        if (result?.error_code === "linkedin_checkpoint") { await saveLocked({capturePaused: true, stage: "BLOCKED", message: "LinkedIn checkpoint on the search tab. Resolve it, then Resume. (ICP Match keeps running.)"}); return; }
+        if (result?.blocked) { M.captureStop = result.error_code || "unsupported_search_layout"; return; }
+        const fp = result.page_fingerprint || "";
+        M.discovered += (result.rows || []).length; M.pagesProcessed += 1;
+        const newRows = (result.captured || []).filter(row => row.profile_url && !M.seen.has(canonicalProfileUrl(row.profile_url) || row.profile_url));
+        const take = newRows.slice(0, requested - M.rows.length);
+        if (take.length) {
+          const scored = await scorePageRows(take, ctx);
+          for (const sr of scored) M.rows.push(sr);
+          take.forEach(row => M.seen.add(canonicalProfileUrl(row.profile_url) || row.profile_url));
+          const c = counts();
+          await persist({stage: "SCAN_PAGE", message: `Page ${M.currentPage}: ${M.rows.length}/${requested} scored - ${c.qualifiedCount} qualified - ${c.pendingCount} matching`});
+        }
+        if (M.rows.length >= requested) { M.captureStop = "target_reached"; return; }
+        if (!result.has_next) { M.captureStop = (!(result.rows || []).length && !fp) ? "capture_yielded_no_results" : "search_results_complete"; return; }
+        const nextState = await advanceSearchPage(captureTabId, M.currentPage, fp); if (!nextState) { M.captureStop = "search_results_complete"; return; }
+        M.currentPage = Math.max(M.currentPage + 1, Number(nextState.page) || 0);
       }
-      const sc = results.filter(r => Number.isFinite(Number(r.icp_score))).length;
-      await save({page: currentPage, processedProfiles: [...seen], results, done: collected, discovered, pagesProcessed, scored: sc, notComputed: results.length - sc, message: `Page ${currentPage}: ${collected}/${requested} prospect(s) captured + scored`});
-      if (collected >= requested) { stopReason = "target_reached"; break; }
-      if (!result.has_next) { stopReason = (!(result.rows || []).length && !page_fingerprint) ? "capture_yielded_no_results" : "search_results_complete"; break; }
-      await save({stage: "NEXT_PAGE"});
-      const nextState = await advanceSearchPage(tabId, currentPage, page_fingerprint); if (!nextState) { stopReason = "search_results_complete"; break; }
-      currentPage = Math.max(currentPage + 1, Number(nextState.page) || 0); await save({page: currentPage, stage: "SCAN_PAGE"});
-    }
-    if (stopReason === "cancelled") { await save({running: false, stage: "CANCELLED", message: `Cancelled · ${results.length} scored. Use Download CSV for partial results.`}); return; }
-    // Phase 2: compute ICP Match for QUALIFIED prospects (deep profile + company visit).
-    await save({stage: "ICP_MATCH", matchIndex: 0, stop_reason: stopReason, message: "Capture complete — evaluating ICP Match for qualified prospects…"});
-    const phaseDone = await runIcpMatchPhase({cfg, qwenKey});
-    if (!phaseDone) return; // paused (checkpoint) or cancelled — resume continues the phase
-    const st = await stored();
-    await finishLocal(st.results || results, stopReason);
-  } catch (error) {
-    await save({running: false, stage: "FAILED", stop_reason: stopReason || error.message, message: error.message});
+      M.captureStop = "target_reached";
+    } catch (e) { M.captureStop = M.captureStop || `capture_error:${String(e && e.message || "error").slice(0, 60)}`; }
+    finally { M.captureDone = true; await persist({captureStop: M.captureStop}); }
   }
+
+  // ---- MATCH CONSUMER (worker tab) -- commits a qualified row only once matched ----
+  async function matchConsumer() {
+    if (!fullIcp) return; // no full-ICP compile (needs Qwen) -> handled at finish
+    let worker = null;
+    try {
+      while (true) {
+        let s = await stored(); if (s.cancelled) return;
+        while (s.paused || s.matchPaused) { await sleep(400); s = await stored(); if (s.cancelled) return; }
+        const item = pending()[0];
+        if (!item) { if (M.captureDone) return; await sleep(300); continue; }
+        if (!worker) worker = await acquireLinkedInWorkerTab(item.linkedin_url || "https://www.linkedin.com/feed/");
+        const c = counts();
+        await persist({stage: "ICP_MATCH", message: `ICP Match ${c.matchedCount + 1}/${c.qualifiedCount} (${c.matchTrueCount} TRUE - ${c.pendingCount} pending) - ${item.full_name || item.linkedin_url}`});
+        let res;
+        try { res = await computeIcpMatch(item, worker.tab.id, mctx, companyCache); }
+        catch (e) { if (String(e && e.message) === "cancelled") return; res = {icp_match: "FALSE", matched_icp: "", icp_match_details: `icp_match_error:${String(e && e.message || "error").slice(0, 60)}`}; }
+        if (res.checkpoint) { await saveLocked({matchPaused: true, stage: "BLOCKED", message: "LinkedIn checkpoint in the worker tab (ICP Match). Resolve it, then Resume. (Capture keeps running.)"}); continue; }
+        Object.assign(item, res);
+        if (!item.icp_match) item.icp_match = "FALSE"; // never leave an attempted row unresolved
+        try { await chrome.storage.local.set({localCompanyCache: companyCache}); } catch {}
+        await persist();
+      }
+    } catch (e) { /* leave remaining pending for a durable resume */ }
+  }
+
+  await Promise.all([captureLoop(), matchConsumer()]);
+
+  const st = await stored();
+  if (st.cancelled) { await closeWorkerTab(); await save({running: false, stage: "CANCELLED", message: `Cancelled - ${readyLocal().length} row(s) ready. Use Download CSV for partial results.`}); return; }
+  if (st.paused || st.capturePaused || st.matchPaused) return; // checkpoint/pause -> Resume re-enters and continues
+  if (!fullIcp && pending().length) { await finishLocalPassthrough(M.rows, M.captureStop || "batch_complete"); return; }
+  if (pending().length) return; // safety: a checkpoint left rows pending; heartbeat resumes
+  await closeWorkerTab();
+  await finishLocal(M.rows, M.captureStop || "batch_complete");
+}
+// No Qwen key -> no full-ICP compile: export qualified rows with ICP Match PENDING
+// rather than blocking them forever.
+async function finishLocalPassthrough(results, stopReason) {
+  const rows = results.map(r => (r.qualification === "qualified" && !r.icp_match) ? {...r, icp_match: "PENDING", icp_match_details: "icp_match_not_evaluated_no_qwen_key"} : r);
+  await finishLocal(rows, stopReason);
 }
 async function resumeDurableOperation() { const state = await stored(); if (!state.running || state.paused || wakeLock) return; wakeLock = true; try { if (state.mode === "local") await runLocalCapture({resume: true}); } finally { wakeLock = false; } }
 
@@ -483,15 +542,15 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
     const cfg = (await chrome.storage.local.get("localConfig")).localConfig || {};
     await chrome.storage.local.set({localConfig: {...cfg, qwenModel: String(message.qwenModel || cfg.qwenModel || "qwen3.7-plus").trim(), region: message.region || cfg.region || "intl", icpText: String(message.icpText || "")}});
     await chrome.storage.local.remove("localCsv");
-    await save({mode: "local", running: false, paused: false, cancelled: false, results: [], processedProfiles: [], discovered: 0, pagesProcessed: 0, done: 0, matchIndex: 0, target: Math.max(1, Number(message.target) || 50), stage: "QUEUED", message: "Starting local capture + scoring…"});
+    await save({mode: "local", running: false, paused: false, cancelled: false, capturePaused: false, matchPaused: false, results: [], processedProfiles: [], discovered: 0, pagesProcessed: 0, done: 0, qualifiedCount: 0, matchedCount: 0, matchTrueCount: 0, pendingCount: 0, captureStop: "", workerTabId: 0, target: Math.max(1, Number(message.target) || 50), stage: "QUEUED", message: "Starting local capture + scoring…"});
     wakeLock = true; runLocalCapture({target: message.target}).finally(() => wakeLock = false);
     return {ok: true};
   }
-  if (message.type === "PAUSE_OPERATION") { await save({paused: true, message: "Paused at a safe point"}); return {ok: true}; }
-  if (message.type === "RESUME_OPERATION") { await save({paused: false, running: true, cancelled: false, message: "Resuming…"}); await resumeDurableOperation(); return {ok: true}; }
-  if (message.type === "CANCEL_OPERATION") { await save({cancelled: true, running: false, paused: false, stage: "CANCELLED", message: "Cancelled. Use Download CSV for partial results."}); return {ok: true}; }
+  if (message.type === "PAUSE_OPERATION") { await saveLocked({paused: true, message: "Paused at a safe point"}); return {ok: true}; }
+  if (message.type === "RESUME_OPERATION") { await saveLocked({paused: false, capturePaused: false, matchPaused: false, running: true, cancelled: false, message: "Resuming…"}); await resumeDurableOperation(); return {ok: true}; }
+  if (message.type === "CANCEL_OPERATION") { await saveLocked({cancelled: true, running: false, paused: false, capturePaused: false, matchPaused: false, stage: "CANCELLED", message: "Cancelled. Use Download CSV for partial results."}); await closeWorkerTab(); return {ok: true}; }
   if (message.type === "DOWNLOAD_CSV") {
-    const state = await stored(); const results = state.results || [];
+    const state = await stored(); const results = readyRows(state.results || []);
     if (results.length) { const csv = buildScoreCsv(dedupeRows(results)); await chrome.storage.local.set({localCsv: csv}); await chrome.downloads.download({url: csvDataUrl(csv), filename: "local-lead-icp-scores.csv"}); return {ok: true}; }
     const {localCsv} = await chrome.storage.local.get("localCsv");
     if (localCsv) { await chrome.downloads.download({url: csvDataUrl(localCsv), filename: "local-lead-icp-scores.csv"}); return {ok: true}; }
