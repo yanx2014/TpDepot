@@ -6,7 +6,7 @@
 import {
   canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeIcp, icpEmbedTexts,
   scoreRow, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, expandIcpPrompt,
-  reviewBatchPrompt, needsAudit, decideQualification, buildScoreCsv, dedupeRows, filterTitleVariants, filterKeywordVariants, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
+  qualification, buildScoreCsv, dedupeRows, filterTitleVariants, filterKeywordVariants, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
   deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier,
   checkVerifier, KDF_ITERATIONS,
 } from "./feed.js";
@@ -181,11 +181,9 @@ async function resolveLocationScore(location, ctx) {
   try { await chrome.storage.local.set({localLocCache: ctx.locCache}); } catch {}
   return score;
 }
-const auditKeyFor = (rf, ctx) => sha256Hex(`${ctx.icpHash}|${rf.job_title}|${rf.job_section}|${rf.headline}|${rf.company}|${rf.location}`);
-// Score one page of newly-captured rows locally, then decide Qualification via a
-// two-factor rule: the deterministic score PLUS an ICP-aware Qwen fit audit that runs
-// ONLY on the ambiguous gray zone (needsAudit) and is micro-batched (≤10 prospects per
-// call) and cached per prospect — so obvious rows cost zero audit tokens.
+// Score one page of newly-captured rows locally. Qualification is purely score-based
+// (score >= threshold → qualified). No LLM fit audit — the numeric score is the sole
+// qualification signal.
 async function scorePageRows(rows, ctx) {
   const fields = rows.map(r => rowFieldsFromCapture(r));
   const scorable = fields.filter(rf => rf.full_name || rf.headline || rf.job_section);
@@ -195,64 +193,24 @@ async function scorePageRows(rows, ctx) {
   for (const t of texts) if (ctx.embedCache.has(t)) vectors[t] = ctx.embedCache.get(t);
   const wanted = [...texts].filter(t => !(t in vectors));
   if (wanted.length) { try { const vecs = await embed(wanted, {apiKey: ctx.openaiKey}); wanted.forEach((t, i) => { if (vecs[i]) { vectors[t] = vecs[i]; ctx.embedCache.set(t, vecs[i]); } }); } catch (e) { /* leave unmapped → NOT COMPUTED */ } }
-
-  // 1) deterministic score for every row
-  const built = [];
+  const out = [];
   for (const rf of fields) {
     const base = {
       full_name: rf.full_name, job_title: rf.job_title, job_section: rf.job_section, headline: rf.headline,
-      company: rf.company, location: rf.location, linkedin_url: rf.linkedin_url,
-      fit_verdict: "", decision_basis: "score", qwen_review: "", note: "",
+      company: rf.company, location: rf.location, linkedin_url: rf.linkedin_url, note: "",
     };
     if (!rf.full_name && !rf.headline && !rf.job_section) {
-      built.push({rf, s: null, row: {...base, icp_score: "NOT COMPUTED", c_job_title: null, c_job_section_headline: null, c_location: null, qualification: "unqualified", note: "private_or_empty_profile"}});
+      out.push({...base, icp_score: "NOT COMPUTED", c_job_title: null, c_job_section_headline: null, c_location: null, qualification: "unqualified", note: "private_or_empty_profile"});
       continue;
     }
     const locScore = ctx.icp.locations.length ? await resolveLocationScore(rf.location, ctx) : 0;
     const s = scoreRow(rf, ctx.icp, vectors, locScore);
-    const row = {...base, icp_score: s.score, c_job_title: s.job_title, c_job_section_headline: s.job_section_headline, c_location: s.location};
-    if (s.score === "NOT COMPUTED") { row.note = "embeddings_unavailable"; row.qualification = "unqualified"; built.push({rf, s: null, row}); continue; }
-    if (s.needs_review) row.note = "cross_field_title_match";
-    built.push({rf, s, row});
+    const row = {...base, icp_score: s.score, c_job_title: s.job_title, c_job_section_headline: s.job_section_headline, c_location: s.location, qualification: qualification(s.score)};
+    if (s.score === "NOT COMPUTED") row.note = "embeddings_unavailable";
+    else if (s.needs_review) row.note = "cross_field_title_match";
+    out.push(row);
   }
-
-  // 2) gather gray-zone rows that need an audit (cached verdicts reused)
-  const cache = ctx.qwenKey ? ((await chrome.storage.local.get("localReviewCache")).localReviewCache || {}) : {};
-  const pending = [];
-  for (const item of built) {
-    if (!item.s || !needsAudit(item.s)) continue;
-    item.key = await auditKeyFor(item.rf, ctx);
-    if (cache[item.key]) item.verdict = cache[item.key];
-    else if (ctx.qwenKey) pending.push(item);
-  }
-  // 3) micro-batched Qwen audit (≤10 uncached gray-zone prospects per call)
-  if (ctx.qwenKey && pending.length) {
-    for (let off = 0; off < pending.length; off += 10) {
-      const batch = pending.slice(off, off + 10);
-      try {
-        const {system, user, max_tokens, temperature, json} = reviewBatchPrompt(batch.map(b => b.rf), ctx.icp);
-        const text = await chatLLM({apiKey: ctx.qwenKey, model: ctx.cfg.qwenModel, region: ctx.cfg.region, system, user, max_tokens, temperature, json});
-        for (const r of (extractJson(text) || {}).results || []) {
-          const item = batch[Number(r.i)];
-          if (!item) continue;
-          const verdict = ["fit", "no_fit", "uncertain"].includes(r.verdict) ? r.verdict : "uncertain";
-          item.verdict = {verdict, reason: String(r.reason || "").slice(0, 90)};
-          cache[item.key] = item.verdict;
-        }
-      } catch (e) { /* audit unavailable → rows fall back to the score rule */ }
-    }
-    try { await chrome.storage.local.set({localReviewCache: cache}); } catch {}
-  }
-  // 4) finalize Qualification (two-factor) + explainability columns
-  for (const item of built) {
-    if (!item.s) continue;
-    const v = item.verdict;
-    const dq = decideQualification(item.s.score, v && v.verdict);
-    item.row.qualification = dq.qualification;
-    item.row.decision_basis = dq.basis;
-    if (v) { item.row.fit_verdict = v.verdict.replace("_", " "); if (v.reason) item.row.qwen_review = `${v.verdict.replace("_", " ")}: ${v.reason}`; }
-  }
-  return built.map(b => b.row);
+  return out;
 }
 
 /* ------------------------------------------------------------- CSV finish */
