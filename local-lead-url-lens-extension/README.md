@@ -1,4 +1,4 @@
-# Local Lead URL Lens 1.2.0
+# Local Lead URL Lens 1.3.0
 
 A standalone Manifest V3 extension that **captures LinkedIn People Search / Sales Navigator prospects and scores them locally against your ICP, then downloads a CSV** — with **no backend and no CRM**. It is a separate extension from the CRM-connected *Lead URL Lens*; nothing here talks to `lead-url-lens-crm…chatgpt.site`.
 
@@ -32,6 +32,17 @@ The 65/20/15 weights and the deterministic rule are unchanged. What improved is 
 
 - **Lexical exact match first (inflection-tolerant since v1.2.0).** If an accepted title/keyword appears in the prospect's text as a whole word/phrase, that term scores **1.0** directly — no embedding needed (this also rescues rows whose embeddings failed). Matching is accent- and case-insensitive, skips FR/EN function words (*de, du, chez, of, at…*), and normalizes standard French gender/plural endings so **"Fondatrice" matches "Fondateur"**, "Directrices" matches "Directeur", "Consultante" matches "Consultant". Tokens compare by equality, never substring — "directorate" still does not match "director".
 - **Gender-complete variant expansion (v1.2.0).** The Qwen expansion now always emits both French masculine **and feminine** role forms, plurals, and both short-role and role+domain forms; the expansion cache is versioned so improved prompts regenerate variants for an unchanged ICP.
+
+### v1.3.0 — generalized title-evidence matching (any industry)
+
+All rules derive from the ICP's accepted values — nothing is hardcoded to a specific industry. The 65/20/15 weights are unchanged; what improved is where the title evidence may legitimately come from:
+
+- **Headline counts for the Job Title term.** The 65-point term now scores the best of the extracted title and the headline (many people put a generic title in the position field and their real role in the headline). A **negation guard** ignores hits immediately preceded by *ex, ancien(ne), former, aspiring, futur(e)* — "Ex-Fondateur" never earns the points.
+- **Tight gapped matching.** An accepted phrase matches within one field even with up to 3 intervening tokens ("Directeur ⟨exécutif⟩ cabinet de recrutement", "Directeur ⟨Fed Supply IDF⟩ - Cabinet de recrutement"). Full hit, unflagged.
+- **Cross-field split matching.** If the accepted title's head role token appears in the title/headline and its remaining tokens all appear across title+section+headline, the term scores 1.0 — flagged `cross_field_title_match` in the Note column **and force-reviewed by Qwen** (advisory only) since the evidence is stitched together.
+- **Company-name domain evidence.** A firm literally named after the ICP's domain ("Dirigeante-Fondatrice chez **Focus Recrutement**") satisfies the domain half of an accepted role+domain title. Same flag + forced advisory review. In-house look-alikes ("Directeur du recrutement chez TotalEnergies") do **not** fire this rule — the domain word must be in the company name, not the role.
+- **Expansion v3.** Variants may include owner-operator equivalents ("Chef d'entreprise", "Dirigeant", "Gérant"…) only when strictly equivalent, plus essential single-token domain words as keyword variants. Cache regenerates automatically (versioned salt).
+- **CSV dedupe safeguard.** Rows are deduplicated by canonical profile URL at export time.
 - **Cosine calibration.** Raw embedding cosines compress the range (~0.25–0.40 even for unrelated jobs). Calibration maps cosine **≤ 0.35 → 0** and **≥ 0.80 → 1** (linear between) before the weights apply, so wrong profiles fall toward 0 and near-synonyms toward 100. Constants: `CALIBRATION` in `feed.js`.
 - **ICP variant expansion (needs Qwen key).** One cached Qwen call expands your accepted titles/keywords into strict same-role variants — synonyms, abbreviations ("VP"/"Vice President"), and French/English translations ("Sales Director"/"Directeur Commercial"). Scoring takes the max over originals ∪ variants; your accepted values stay authoritative, and you can supply your own `job_title_variants` / `keyword_variants` lists in a structured ICP to skip Qwen.
 - **Persistent caches.** ICP criterion embeddings, location verdicts, and Qwen reviews persist across runs in `chrome.storage.local` (same ICP → no re-embedding, consistent location decisions, fewer API calls). Profile-text embeddings are reused within a run.

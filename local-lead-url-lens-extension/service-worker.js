@@ -6,7 +6,7 @@
 import {
   canonicalProfileUrl, rowFieldsFromCapture, normText, fold, activeIcp, icpEmbedTexts,
   scoreRow, exactLocationScore, compileIcpPrompt, locationNormalizePrompt, expandIcpPrompt,
-  reviewPrompt, buildScoreCsv, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
+  reviewPrompt, buildScoreCsv, dedupeRows, csvDataUrl, chatLLM, embed, extractJson, sha256Hex,
   deriveVaultKey, exportKeyRaw, importKeyRaw, encryptWithKey, decryptWithKey, makeVerifier,
   checkVerifier, KDF_ITERATIONS,
 } from "./feed.js";
@@ -117,8 +117,9 @@ async function expandIcpValues(icp, cfg, qwenKey) {
   if (!qwenKey || (!icp.job_titles.length && !icp.keywords.length)) return icp;
   if (icp.job_title_variants.length || icp.keyword_variants.length) return icp; // user supplied their own
   // EXPANSION_VERSION salts the cache so an improved expansion prompt regenerates
-  // variants for an unchanged ICP (v2 added FR masculine+feminine forms).
-  const EXPANSION_VERSION = "v2";
+  // variants for an unchanged ICP (v2: FR masculine+feminine; v3: owner-operator
+  // equivalents, short-role forms, single-token domain keywords, generalized).
+  const EXPANSION_VERSION = "v3";
   const hash = await sha256Hex(`${EXPANSION_VERSION}|${JSON.stringify([icp.job_titles, icp.keywords])}`);
   const cached = (await chrome.storage.local.get("localIcpExpanded")).localIcpExpanded;
   if (cached && cached.hash === hash) return {...icp, job_title_variants: cached.job_title_variants || [], keyword_variants: cached.keyword_variants || []};
@@ -198,7 +199,7 @@ async function scorePageRows(rows, ctx) {
   // no scorable evidence — flag them instead of producing a meaningless low score.
   const scorable = fields.filter(rf => rf.full_name || rf.headline || rf.job_section);
   const texts = new Set();
-  for (const rf of scorable) { if (rf.job_title) texts.add(normText(rf.job_title)); const sh = normText(`${rf.job_section} ${rf.headline}`); if (sh) texts.add(sh); }
+  for (const rf of scorable) { if (rf.job_title) texts.add(normText(rf.job_title)); const hl = normText(rf.headline); if (hl) texts.add(hl); const sh = normText(`${rf.job_section} ${rf.headline}`); if (sh) texts.add(sh); }
   const vectors = {...ctx.icpVectors};
   for (const t of texts) if (ctx.embedCache.has(t)) vectors[t] = ctx.embedCache.get(t); // run-level reuse across pages
   const wanted = [...texts].filter(t => !(t in vectors));
@@ -217,7 +218,11 @@ async function scorePageRows(rows, ctx) {
     const s = scoreRow(rf, ctx.icp, vectors, locScore);
     const row = {...base, icp_score: s.score, c_job_title: s.job_title, c_job_section_headline: s.job_section_headline, c_location: s.location};
     if (s.score === "NOT COMPUTED") row.note = "embeddings_unavailable";
-    else if (ctx.qwenKey && s.score >= REVIEW_BAND.min && s.score <= REVIEW_BAND.max) row.qwen_review = await qwenReview(rf, ctx);
+    else {
+      if (s.needs_review) row.note = "cross_field_title_match";
+      // Forced advisory review for weak-evidence title matches, plus the usual 40-70 band.
+      if (ctx.qwenKey && (s.needs_review || (s.score >= REVIEW_BAND.min && s.score <= REVIEW_BAND.max))) row.qwen_review = await qwenReview(rf, ctx);
+    }
     out.push(row);
   }
   return out;
@@ -225,13 +230,14 @@ async function scorePageRows(rows, ctx) {
 
 /* ------------------------------------------------------------- CSV finish */
 async function finishLocal(results, stopReason) {
+  const rows = dedupeRows(results);
   let downloadOk = false, downloadError = "";
-  try { const csv = buildScoreCsv(results); await chrome.storage.local.set({localCsv: csv}); await chrome.downloads.download({url: csvDataUrl(csv), filename: "local-lead-icp-scores.csv", saveAs: false}); downloadOk = true; }
+  try { const csv = buildScoreCsv(rows); await chrome.storage.local.set({localCsv: csv}); await chrome.downloads.download({url: csvDataUrl(csv), filename: "local-lead-icp-scores.csv", saveAs: false}); downloadOk = true; }
   catch (error) { downloadError = error?.message || "download_failed"; }
-  const scored = results.filter(r => Number.isFinite(Number(r.icp_score))).length, notComputed = results.length - scored;
+  const scored = rows.filter(r => Number.isFinite(Number(r.icp_score))).length, notComputed = rows.length - scored;
   await save({running: false, stage: downloadOk ? "DONE" : "FAILED", stop_reason: stopReason,
     message: downloadOk
-      ? `Done · ${results.length} prospect(s) · ${scored} scored · ${notComputed} not computed · CSV downloaded (${stopReason.replaceAll("_", " ")})`
+      ? `Done · ${rows.length} prospect(s) · ${scored} scored · ${notComputed} not computed · CSV downloaded (${stopReason.replaceAll("_", " ")})`
       : `Run finished but CSV export failed: ${downloadError}. Use Download CSV to retry.`});
 }
 
@@ -366,7 +372,7 @@ chrome.runtime.onMessage.addListener((message, _sender, send) => { (async () => 
   if (message.type === "CANCEL_OPERATION") { await save({cancelled: true, running: false, paused: false, stage: "CANCELLED", message: "Cancelled. Use Download CSV for partial results."}); return {ok: true}; }
   if (message.type === "DOWNLOAD_CSV") {
     const state = await stored(); const results = state.results || [];
-    if (results.length) { const csv = buildScoreCsv(results); await chrome.storage.local.set({localCsv: csv}); await chrome.downloads.download({url: csvDataUrl(csv), filename: "local-lead-icp-scores.csv"}); return {ok: true}; }
+    if (results.length) { const csv = buildScoreCsv(dedupeRows(results)); await chrome.storage.local.set({localCsv: csv}); await chrome.downloads.download({url: csvDataUrl(csv), filename: "local-lead-icp-scores.csv"}); return {ok: true}; }
     const {localCsv} = await chrome.storage.local.get("localCsv");
     if (localCsv) { await chrome.downloads.download({url: csvDataUrl(localCsv), filename: "local-lead-icp-scores.csv"}); return {ok: true}; }
     return {ok: false, error: "No results to export yet."};

@@ -71,6 +71,12 @@ export function jobTitleFromSection(jobSection, headline) {
   }
   return headlineParts(headline).title;
 }
+// Company segment of the current position ("chez X" / "at X") — used as domain
+// evidence: a firm literally named after the ICP's domain IS the domain.
+export function companyFromSection(jobSection) {
+  const m = String(jobSection || "").match(/(?:\schez\s|\sat\s|@)\s*(.+)$/i);
+  return m ? normText(m[1]) : "";
+}
 // Build the descriptive fields used for scoring + CSV from one captured search row.
 export function rowFieldsFromCapture(data = {}) {
   const job_section = normText(data.job_section);
@@ -81,6 +87,7 @@ export function rowFieldsFromCapture(data = {}) {
     job_title,
     job_section,
     headline,
+    company: normText(data.company) || companyFromSection(job_section),
     location: normText(data.location),
     linkedin_url: canonicalProfileUrl(data.profile_url) || canonicalUrl(data.profile_url),
   };
@@ -118,9 +125,9 @@ Rules: include a list ONLY if the ICP supplies values for it (use an empty array
 // abbreviations, FR-EN translations). One cached call; expansion is best-effort and
 // only widens matching — the accepted values and the scoring rule are unchanged.
 export function expandIcpPrompt(icp) {
-  const system = `You expand accepted ICP values for LinkedIn lead scoring. For each accepted job title and keyword, generate close variants a matching profile might display instead: common synonyms, standard abbreviations (e.g. "VP" / "Vice President"), and French/English translations. For every French role word ALWAYS include BOTH the masculine and feminine forms (Fondateur AND Fondatrice, Directeur AND Directrice, Consultant AND Consultante) and common plurals. For roles tied to a domain, include BOTH the short role form ("Fondateur") and the role-plus-domain form ("Fondateur de cabinet de recrutement"). Stay strictly equivalent in seniority and function — never broaden to a different role or a more junior/senior level. Output ONLY a JSON object: {"job_title_variants":["…"],"keyword_variants":["…"]} containing ONLY the new variants (not the originals).`;
+  const system = `You expand accepted ICP values for lead scoring, in any industry. For each accepted job title and keyword, generate close variants a matching profile might display instead: common synonyms, standard abbreviations (e.g. "VP" / "Vice President"), and translations between the ICP's languages (at minimum French and English). For every role word in a gendered language ALWAYS include all gender forms (Fondateur AND Fondatrice, Directeur AND Directrice) and common plurals. For role-plus-domain titles, include BOTH the short role form and the role-plus-domain form. Include owner-operator equivalents ("Chef d'entreprise", "Dirigeant", "Gérant", "Président", "CEO", "Directeur Général") ONLY when they are strictly equivalent to an accepted role's seniority and function (e.g. the ICP targets founders/owners). As keyword_variants, also include the essential single-token domain words extracted from the accepted values (e.g. the domain noun of a role-plus-domain phrase). Never broaden to a different role, a different industry, or a more junior/senior level. Output ONLY a JSON object: {"job_title_variants":["…"],"keyword_variants":["…"]} containing ONLY the new variants (not the originals).`;
   const user = JSON.stringify({ job_titles: icp.job_titles, keywords: icp.keywords });
-  return { system, user, max_tokens: 1500, temperature: 0, json: true };
+  return { system, user, max_tokens: 1800, temperature: 0, json: true };
 }
 // Qwen prompt: advisory review of one borderline prospect. The verdict goes in its own
 // CSV column and NEVER changes the numeric score (the LLM never assigns points).
@@ -165,6 +172,9 @@ export function calibrate(cos) {
 // substring, so "directorate" still does not match "director". A lexical hit scores the
 // term 1.0 without needing embeddings.
 const LEXICAL_STOPWORDS = new Set(["a", "an", "and", "at", "au", "aux", "chez", "d", "dans", "de", "des", "du", "en", "et", "for", "in", "l", "la", "le", "les", "of", "or", "ou", "the", "to", "un", "une", "with"]);
+// Negators: a role hit whose matched phrase is immediately preceded by one of these does
+// not count ("Ex-Fondateur", "ancien directeur", "aspiring director", "futur CEO").
+const NEGATORS = new Set(["ex", "ancien", "ancienne", "anciens", "anciennes", "anciennement", "former", "formerly", "aspiring", "futur", "future", "futurs", "futures", "past"]);
 export function normalizeToken(token) {
   let t = token;
   if (t.length > 3 && t.endsWith("s")) t = t.slice(0, -1);                       // plural
@@ -175,25 +185,49 @@ export function normalizeToken(token) {
   else if (t.length > 4 && t.endsWith("e")) t = t.slice(0, -1);                  // consultante→consultant
   return t;
 }
-export function contentTokens(value) {
+// Aligned {raw, norm} content tokens — raw kept so negation checks see the actual word.
+export function tokenPairs(value) {
   return (fold(value).match(/[a-z0-9]+/g) || [])
     .filter(t => !LEXICAL_STOPWORDS.has(t))
-    .map(normalizeToken);
+    .map(t => ({raw: t, norm: normalizeToken(t)}));
 }
+export function contentTokens(value) { return tokenPairs(value).map(p => p.norm); }
+const negatedAt = (pairs, i) => i > 0 && NEGATORS.has(pairs[i - 1].raw);
 export function lexicalMatch(text, values) {
-  const tt = contentTokens(text);
-  if (!tt.length) return false;
+  const tp = tokenPairs(text);
+  if (!tp.length) return false;
   for (const v of values) {
     const vt = contentTokens(v);
     if (!vt.length || (vt.length === 1 && vt[0].length < 2)) continue;
-    for (let i = 0; i + vt.length <= tt.length; i++) {
+    for (let i = 0; i + vt.length <= tp.length; i++) {
       let hit = true;
-      for (let j = 0; j < vt.length; j++) if (tt[i + j] !== vt[j]) { hit = false; break; }
-      if (hit) return true;
+      for (let j = 0; j < vt.length; j++) if (tp[i + j].norm !== vt[j]) { hit = false; break; }
+      if (hit && !negatedAt(tp, i)) return true;
     }
   }
   return false;
 }
+// Ordered match within ONE field: value tokens appear in order with at most `maxGap`
+// extra tokens between consecutive ones ("directeur ⟨exécutif⟩ cabinet recrutement",
+// "directeur ⟨fed supply idf⟩ cabinet recrutement"). Start token must not be negated.
+export function orderedGapMatch(text, valueTokens, maxGap = 3) {
+  const tp = tokenPairs(text);
+  if (!tp.length || !valueTokens.length) return false;
+  for (let start = 0; start < tp.length; start++) {
+    if (tp[start].norm !== valueTokens[0] || negatedAt(tp, start)) continue;
+    let pos = start, ok = true;
+    for (let j = 1; j < valueTokens.length; j++) {
+      let found = -1;
+      for (let k = pos + 1; k <= Math.min(tp.length - 1, pos + 1 + maxGap); k++) if (tp[k].norm === valueTokens[j]) { found = k; break; }
+      if (found < 0) { ok = false; break; }
+      pos = found;
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+const hasToken = (text, tok) => tokenPairs(text).some(p => p.norm === tok);
+const hasTokenGuarded = (text, tok) => { const tp = tokenPairs(text); return tp.some((p, i) => p.norm === tok && !negatedAt(tp, i)); };
 // Best cosine of `text` against a list of accepted values, using the shared vector map.
 function bestMatch(text, values, vectors) {
   const tv = vectors[normText(text)];
@@ -202,28 +236,77 @@ function bestMatch(text, values, vectors) {
   for (const v of values) { const ov = vectors[normText(v)]; if (ov) best = Math.max(best, cosine(tv, ov)); }
   return best;
 }
-// One weighted term: lexical exact match first (1.0, rescues missing embeddings), else
-// calibrated best-cosine via embeddings (null → NOT COMPUTED decided by the caller).
-function matchTerm(text, values, vectors) {
-  if (!values.length) return 0;
-  if (lexicalMatch(text, values)) return 1.0;
-  return calibrate(bestMatch(text, values, vectors));
+// Title-term lexical evidence (generic, any industry — all rules derive from the ICP's
+// accepted values). Three deterministic paths, strongest first:
+//  1. TIGHT: an accepted value's tokens appear in order within ONE field (title,
+//     headline, or section) with ≤3 extra tokens between consecutive ones — covers
+//     exact phrases, intervening modifiers ("Directeur ⟨exécutif⟩ cabinet…") and
+//     embedded brands ("Directeur ⟨Fed Supply IDF⟩ - Cabinet de recrutement").
+//     Full hit, no forced review.
+//  2. LOOSE (cross-field/scattered): the value's head role token matches in the title
+//     or headline AND every remaining content token appears somewhere across
+//     title+section+headline. Full hit + forced advisory review.
+//  3. COMPANY DOMAIN: head role token matches in title/headline AND any remaining
+//     token appears in the company name ("Dirigeante-Fondatrice chez Focus
+//     Recrutement"). Full hit + forced advisory review.
+// All head/phrase matches are negation-guarded (ex/ancien/former/aspiring/futur).
+export function titleLexicalEvidence(rf, titleValues) {
+  const fields = [rf.job_title, rf.headline, rf.job_section].map(normText).filter(Boolean);
+  if (!fields.length) return { hit: false, review: false };
+  const allText = fields.join(" ");
+  const companyText = normText(rf.company || "");
+  const roleFields = [rf.job_title, rf.headline].map(normText).filter(Boolean);
+  let loose = false;
+  for (const v of titleValues) {
+    const vt = contentTokens(v);
+    if (!vt.length) continue;
+    if (vt.length === 1) {
+      if (vt[0].length >= 2 && fields.some(f => hasTokenGuarded(f, vt[0]))) return { hit: true, review: false };
+      continue;
+    }
+    if (fields.some(f => orderedGapMatch(f, vt, 3))) return { hit: true, review: false };
+    const head = vt[0], rest = vt.slice(1);
+    if (!roleFields.some(f => hasTokenGuarded(f, head))) continue;
+    if (rest.every(t => hasToken(allText, t))) loose = true;
+    else if (companyText && rest.some(t => hasToken(companyText, t))) loose = true;
+  }
+  return loose ? { hit: true, review: true } : { hit: false, review: false };
 }
 // Score one captured row against the ICP. `vectors` maps normalized text → embedding.
-// Returns {score, job_title, job_section_headline, location} where score is an integer
-// 0–100 or "NOT COMPUTED" when a required semantic embedding could not be produced.
+// Returns {score, job_title, job_section_headline, location, needs_review} where score
+// is an integer 0–100 or "NOT COMPUTED" when a required semantic embedding could not be
+// produced. needs_review marks weak-evidence (cross-field/company) title matches for a
+// forced advisory Qwen review — the number itself never changes.
 export function scoreRow(rf, icp, vectors, locationScore) {
   const jobTitleText = rf.job_title || "";
+  const headlineText = normText(rf.headline || "");
   const sectionHeadlineText = normText(`${rf.job_section} ${rf.headline}`);
   const titleValues = [...new Set([...icp.job_titles, ...(icp.job_title_variants || [])])];
   const semanticValues = [...new Set([...titleValues, ...icp.keywords, ...(icp.keyword_variants || [])])];
+  let needs_review = false;
 
-  // Job Title (65): profile title vs accepted job titles (∪ variants).
-  const jt = icp.job_titles.length ? matchTerm(jobTitleText || sectionHeadlineText, titleValues, vectors) : 0;
+  // Job Title (65): lexical evidence over title+headline(+section), else calibrated
+  // best-cosine over BOTH the extracted title and the headline.
+  let jt = 0;
+  if (icp.job_titles.length) {
+    const ev = titleLexicalEvidence(rf, titleValues);
+    if (ev.hit) { jt = 1.0; needs_review = ev.review; }
+    else {
+      const candidates = [jobTitleText, headlineText].filter(Boolean);
+      if (!candidates.length) candidates.push(sectionHeadlineText);
+      let best = null;
+      for (const c of candidates) { const b = bestMatch(c, titleValues, vectors); if (b !== null) best = Math.max(best ?? 0, b); }
+      jt = calibrate(best);
+    }
+  }
   // Job Section/Headline (20): section+headline text vs accepted titles ∪ keywords (∪ variants).
-  const jsh = semanticValues.length ? matchTerm(sectionHeadlineText || jobTitleText, semanticValues, vectors) : 0;
+  let jsh = 0;
+  if (semanticValues.length) {
+    if (lexicalMatch(sectionHeadlineText || jobTitleText, semanticValues)) jsh = 1.0;
+    else jsh = calibrate(bestMatch(sectionHeadlineText || jobTitleText, semanticValues, vectors));
+  }
   if (jt === null || jsh === null) {
-    return { score: "NOT COMPUTED", job_title: null, job_section_headline: null, location: locationScore };
+    return { score: "NOT COMPUTED", job_title: null, job_section_headline: null, location: locationScore, needs_review: false };
   }
   const loc = icp.locations.length ? (Number.isFinite(locationScore) ? locationScore : 0) : 0;
   const total = WEIGHTS.job_title * (jt || 0) + WEIGHTS.job_section_headline * (jsh || 0) + WEIGHTS.location * loc;
@@ -232,7 +315,18 @@ export function scoreRow(rf, icp, vectors, locationScore) {
     job_title: jt || 0,
     job_section_headline: jsh || 0,
     location: loc,
+    needs_review,
   };
+}
+// R6: canonical-URL dedupe safeguard applied at CSV build time.
+export function dedupeRows(rows) {
+  const seen = new Set(), out = [];
+  for (const r of rows) {
+    const key = fold(canonicalUrl(r.linkedin_url || "")) || `${fold(r.full_name)}|${fold(r.headline)}`;
+    if (seen.has(key)) continue;
+    seen.add(key); out.push(r);
+  }
+  return out;
 }
 // Every embeddable ICP text (accepted job titles ∪ keywords, incl. variants).
 export function icpEmbedTexts(icp) {
